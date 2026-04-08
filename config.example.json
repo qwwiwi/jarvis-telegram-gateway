@@ -1,0 +1,19 @@
+{
+  "_comment": "Jarvis Telegram Gateway config. Copy to config.json and fill in your values.",
+  "poll_interval_sec": 2,
+  "allowlist_user_ids": [123456789],
+  "agents": {
+    "jarvis": {
+      "enabled": true,
+      "telegram_bot_token": "YOUR_BOT_TOKEN_FROM_BOTFATHER",
+      "workspace": "/home/user/.claude-lab/jarvis/.claude",
+      "model": "sonnet",
+      "timeout_sec": 120,
+      "system_reminder": "You are an autonomous AI agent. Be concise.",
+      "groq_api_key": "",
+      "groq_api_key_file": "",
+      "openviking_url": "",
+      "openviking_key_file": ""
+    }
+  }
+}
