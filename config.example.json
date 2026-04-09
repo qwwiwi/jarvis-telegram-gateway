@@ -1,19 +1,44 @@
 {
-  "_comment": "Jarvis Telegram Gateway config. Copy to config.json and fill in your values.",
+  "_comment": "Telegram Gateway config. Copy to config.json and fill in your values.",
+  "_note": "Agent names (jarvis, homer, edith) are EXAMPLES. Replace with your own.",
   "poll_interval_sec": 2,
   "allowlist_user_ids": [123456789],
   "agents": {
     "jarvis": {
+      "_role": "coordinator -- routes tasks, manages agents",
       "enabled": true,
-      "telegram_bot_token": "YOUR_BOT_TOKEN_FROM_BOTFATHER",
+      "telegram_bot_token": "YOUR_JARVIS_BOT_TOKEN",
       "workspace": "/home/user/.claude-lab/jarvis/.claude",
       "model": "sonnet",
       "timeout_sec": 120,
-      "system_reminder": "You are an autonomous AI agent. Be concise.",
-      "groq_api_key": "",
-      "groq_api_key_file": "",
-      "openviking_url": "",
-      "openviking_key_file": ""
+      "system_reminder": "You are a coordinator agent.",
+      "groq_api_key_file": "/path/to/shared/secrets/groq-api-key",
+      "openviking_url": "http://127.0.0.1:1933",
+      "openviking_key_file": "/path/to/shared/secrets/openviking.key"
+    },
+    "homer": {
+      "_role": "coder -- writes code, tests, deploys",
+      "enabled": true,
+      "telegram_bot_token": "YOUR_HOMER_BOT_TOKEN",
+      "workspace": "/home/user/.claude-lab/homer/.claude",
+      "model": "sonnet",
+      "timeout_sec": 300,
+      "system_reminder": "You are a coder agent.",
+      "groq_api_key_file": "/path/to/shared/secrets/groq-api-key",
+      "openviking_url": "http://127.0.0.1:1933",
+      "openviking_key_file": "/path/to/shared/secrets/openviking.key"
+    },
+    "edith": {
+      "_role": "inbox -- receives info, organizes knowledge",
+      "enabled": true,
+      "telegram_bot_token": "YOUR_EDITH_BOT_TOKEN",
+      "workspace": "/home/user/.claude-lab/edith/.claude",
+      "model": "sonnet",
+      "timeout_sec": 120,
+      "system_reminder": "You are a knowledge management agent.",
+      "groq_api_key_file": "/path/to/shared/secrets/groq-api-key",
+      "openviking_url": "http://127.0.0.1:1933",
+      "openviking_key_file": "/path/to/shared/secrets/openviking.key"
     }
   }
 }

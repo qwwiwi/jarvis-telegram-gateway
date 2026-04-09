@@ -2,6 +2,8 @@
 
 Universal Telegram gateway for autonomous Claude Code agents. Connect your AI agent to Telegram with voice transcription, session management, real-time progress display, and semantic memory.
 
+> **NOTE:** Agent names (Jarvis, Homer, Edith) are **examples**. Replace them with your own names when copying this setup.
+
 ## Features
 
 - **Voice messages** -- [Groq](https://groq.com) Whisper transcription (Russian + English)
@@ -44,7 +46,7 @@ pip install -r requirements.txt
 cp config.example.json config.json
 ```
 
-Edit `config.json`:
+Edit `config.json` (example shows 3 agents -- use as many as you need):
 
 ```json
 {
@@ -53,11 +55,27 @@ Edit `config.json`:
   "agents": {
     "jarvis": {
       "enabled": true,
-      "telegram_bot_token": "YOUR_BOT_TOKEN",
-      "workspace": "/path/to/your/.claude",
+      "telegram_bot_token": "YOUR_JARVIS_BOT_TOKEN",
+      "workspace": "~/.claude-lab/jarvis/.claude",
       "model": "sonnet",
       "timeout_sec": 120,
-      "system_reminder": "You are an autonomous AI agent."
+      "system_reminder": "You are a coordinator agent."
+    },
+    "homer": {
+      "enabled": true,
+      "telegram_bot_token": "YOUR_HOMER_BOT_TOKEN",
+      "workspace": "~/.claude-lab/homer/.claude",
+      "model": "sonnet",
+      "timeout_sec": 300,
+      "system_reminder": "You are a coder agent."
+    },
+    "edith": {
+      "enabled": true,
+      "telegram_bot_token": "YOUR_EDITH_BOT_TOKEN",
+      "workspace": "~/.claude-lab/edith/.claude",
+      "model": "sonnet",
+      "timeout_sec": 120,
+      "system_reminder": "You are a knowledge management agent."
     }
   }
 }
