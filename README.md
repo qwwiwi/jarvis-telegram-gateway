@@ -57,7 +57,7 @@ Edit `config.json` (example shows 3 agents -- use as many as you need):
       "enabled": true,
       "telegram_bot_token": "YOUR_JARVIS_BOT_TOKEN",
       "workspace": "~/.claude-lab/jarvis/.claude",
-      "model": "sonnet",
+      "model": "opus",
       "timeout_sec": 120,
       "system_reminder": "You are a coordinator agent."
     },
@@ -65,7 +65,7 @@ Edit `config.json` (example shows 3 agents -- use as many as you need):
       "enabled": true,
       "telegram_bot_token": "YOUR_HOMER_BOT_TOKEN",
       "workspace": "~/.claude-lab/homer/.claude",
-      "model": "sonnet",
+      "model": "opus",
       "timeout_sec": 300,
       "system_reminder": "You are a coder agent."
     },
