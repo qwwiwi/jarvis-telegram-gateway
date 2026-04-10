@@ -763,7 +763,7 @@ def handle_command(token: str, chat_id: int, agent: str, cmd: str, args: str, cf
                 f"<b>memory</b>\n"
                 f"rules (permanent): {rules_kb:.1f} KB\n"
                 f"warm (decisions 14d): {decisions_kb:.1f} KB\n"
-                f"hot (recent 72h): {hot_kb:.1f} KB\n"
+                f"hot (recent 24h): {hot_kb:.1f} KB\n"
                 f"cold (MEMORY.md): {memory_kb:.1f} KB"
             )
         else:
@@ -882,7 +882,7 @@ def handle_command(token: str, chat_id: int, agent: str, cmd: str, args: str, cf
                 f"1. Read core/hot/recent.md (Read tool).\n"
                 f"2. Extract key facts from last 24h and ADD to beginning of core/warm/decisions.md:\n"
                 f"## {today}\n- fact 1\n- fact 2\n\n"
-                f"3. Trim hot/recent.md: keep last 48h.\n"
+                f"3. Trim hot/recent.md: keep last 24h.\n"
                 f"Extract: new preferences, decisions, pending actions, patterns. "
                 f"Skip duplicates.\n"
                 f"Reply: 'compact: N added, hot trimmed'."
@@ -1593,7 +1593,7 @@ def append_to_hot_memory(agent: str, cfg: dict, user_text: str, agent_response: 
             lines = hot_file.read_text().split("\n")
             # Find cutoff -- keep last 600 lines (entries are 4 lines each, 600/4=150 entries)
             if len(lines) > 600:
-                header = "# Hot memory -- last 72h rolling journal\n"
+                header = "# Hot memory -- last 24h rolling journal\n"
                 kept = lines[-600:]
                 # Find first entry header to avoid truncated entry at top
                 for i, ln in enumerate(kept):
@@ -1851,6 +1851,7 @@ _BOT_COMMANDS = [
     {"command": "stop", "description": "Stop current agent task"},
     {"command": "status", "description": "Session and memory status"},
     {"command": "reset", "description": "Reset session (saves important to MEMORY)"},
+    {"command": "reset_force", "description": "Reset without saving"},
     {"command": "compact", "description": "Manual memory compaction"},
     {"command": "help", "description": "Help"},
 ]
