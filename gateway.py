@@ -15,6 +15,13 @@ Features:
 - Media handling (photo, video, voice, document, sticker)
 - Group chat support with @mention / name detection
 - Real-time progress tracking (tool calls, subagent dispatches, TodoWrite plans)
+- Forward context: agent sees who forwarded the message
+- Message reactions: eyes emoji on received messages
+- Inline buttons: send_message_with_buttons + callback query dispatch
+- Sticker cache: cached descriptions for repeated stickers
+- Webhook API: HTTP endpoint for external message injection
+- Per-topic routing: route group-chat topics to specific agents
+- Streaming modes: off / partial / progress (configurable per agent)
 
 Usage:
     1. Copy config.example.json -> config.json
@@ -24,12 +31,15 @@ Usage:
 Config structure (config.json):
     {
         "allowlist_user_ids": [123456789],
+        "webhook_port": 9090,
+        "webhook_token": "your-secret-token",
         "agents": {
             "myagent": {
                 "enabled": true,
                 "workspace": "/path/to/agent/.claude",
                 "model": "sonnet",
                 "timeout_sec": 120,
+                "streaming_mode": "partial",
                 "telegram_bot_token": "123456:AABBccdd...",
                 "telegram_bot_token_file": "/path/to/token.txt",
                 "groq_api_key": "YOUR_GROQ_API_KEY",
@@ -38,6 +48,7 @@ Config structure (config.json):
                 "openviking_key_file": "/path/to/ov.key",
                 "openviking_account": "default",
                 "agent_names": ["myagent", "agent"],
+                "topic_routing": {"-1001234567890": ["42", "99"]},
                 "env": {"KEY": "value"}
             }
         }
@@ -109,9 +120,50 @@ LOG_PATH = _BASE_DIR / "gateway.log"
 CONFIG_PATH = _BASE_DIR / "config.json"
 STATE_DIR = _BASE_DIR / "state"
 MEDIA_DIR = _BASE_DIR / "media-inbound"
+STICKER_CACHE_PATH = STATE_DIR / "sticker-cache.json"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# In-memory sticker description cache (loaded from disk on startup)
+_sticker_cache: dict[str, str] = {}
+if STICKER_CACHE_PATH.exists():
+    try:
+        _sticker_cache = json.loads(STICKER_CACHE_PATH.read_text())
+    except Exception:
+        _sticker_cache = {}
+
+
+def _save_sticker_cache() -> None:
+    try:
+        STICKER_CACHE_PATH.write_text(json.dumps(_sticker_cache, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+def _get_sticker_description(
+    uid: str, emoji: str, set_name: str, local_path: Path | None
+) -> str:
+    """Get or build sticker description. Cache by file_unique_id."""
+    if uid and uid in _sticker_cache:
+        return _sticker_cache[uid]
+
+    parts: list[str] = []
+    if emoji:
+        parts.append(f"emoji {emoji}")
+    if set_name:
+        parts.append(f"set \"{set_name}\"")
+    if local_path:
+        parts.append(str(local_path))
+
+    desc = ", ".join(parts) if parts else "sticker (no description)"
+
+    if uid:
+        _sticker_cache[uid] = desc
+        _save_sticker_cache()
+
+    return desc
+
 
 # Legacy fallback for Groq key (checked after agent config)
 GROQ_KEY_FILE = Path.home() / ".secrets" / "groq-api-key"
@@ -417,6 +469,7 @@ def _send_one(token: str, chat_id: int, text: str, reply_to: int | None, parse_m
     params: dict[str, Any] = {"chat_id": chat_id, "text": text}
     if reply_to:
         params["reply_to_message_id"] = reply_to
+        params["allow_sending_without_reply"] = True
     if parse_mode:
         params["parse_mode"] = parse_mode
     try:
@@ -458,9 +511,23 @@ def send_message(
                 if current:
                     chunks.append(current)
                 if len(p) > limit:
-                    # Hard split long paragraph
-                    for i in range(0, len(p), limit):
-                        chunks.append(p[i : i + limit])
+                    # Try splitting by single newline first, then hard split
+                    sub_lines = p.split("\n")
+                    sub_current = ""
+                    for sl in sub_lines:
+                        if len(sub_current) + len(sl) + 1 <= limit:
+                            sub_current = sub_current + "\n" + sl if sub_current else sl
+                        else:
+                            if sub_current:
+                                chunks.append(sub_current)
+                            if len(sl) > limit:
+                                for i in range(0, len(sl), limit):
+                                    chunks.append(sl[i : i + limit])
+                                sub_current = ""
+                            else:
+                                sub_current = sl
+                    if sub_current:
+                        chunks.append(sub_current)
                     current = ""
                 else:
                     current = p
@@ -477,6 +544,104 @@ def send_chat_action(token: str, chat_id: int, action: str = "typing") -> None:
         tg_api(token, "sendChatAction", chat_id=chat_id, action=action)
     except Exception as e:
         log.warning(f"sendChatAction failed: {e}")
+
+
+def set_reaction(
+    token: str, chat_id: int, message_id: int, emoji: str = "\U0001f440"
+) -> None:
+    """Set emoji reaction on a message (ack). Default: eyes emoji."""
+    try:
+        tg_api(
+            token, "setMessageReaction",
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=json.dumps([{"type": "emoji", "emoji": emoji}]),
+        )
+    except Exception as e:
+        log.debug(f"setMessageReaction failed (non-critical): {e}")
+
+
+def send_message_with_buttons(
+    token: str,
+    chat_id: int,
+    text: str,
+    buttons: list[list[dict[str, str]]],
+    reply_to: int | None = None,
+    html: bool = True,
+) -> dict | None:
+    """Send message with inline keyboard buttons.
+
+    Args:
+        buttons: 2D list of button rows, each button is {"text": "...", "callback_data": "..."}
+                 or {"text": "...", "url": "..."} for URL buttons.
+    Returns:
+        Telegram API response dict or None on error.
+    """
+    if html:
+        text = markdown_to_telegram_html(text)
+    params: dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text[:4000],
+        "reply_markup": json.dumps({"inline_keyboard": buttons}),
+    }
+    if reply_to:
+        params["reply_to_message_id"] = reply_to
+        params["allow_sending_without_reply"] = True
+    if html:
+        params["parse_mode"] = "HTML"
+    try:
+        return tg_api(token, "sendMessage", **params)
+    except requests.HTTPError as e:
+        body = None
+        try:
+            body = e.response.json()
+        except Exception:
+            pass
+        if html and is_html_parse_error(body):
+            params.pop("parse_mode", None)
+            return tg_api(token, "sendMessage", **params)
+        log.warning(f"send_message_with_buttons failed: {e}")
+        return None
+
+
+def answer_callback_query(
+    token: str, callback_query_id: str, text: str = "", show_alert: bool = False
+) -> None:
+    """Answer a callback query (inline button press)."""
+    try:
+        tg_api(
+            token, "answerCallbackQuery",
+            callback_query_id=callback_query_id,
+            text=text,
+            show_alert=show_alert,
+        )
+    except Exception as e:
+        log.warning(f"answerCallbackQuery failed: {e}")
+
+
+# Pending callback handlers: {callback_data_prefix: handler_func}
+# Handler signature: handler(token, agent, cfg, callback_query) -> None
+_CALLBACK_HANDLERS: dict[str, Any] = {}
+
+
+def register_callback_handler(prefix: str, handler: Any) -> None:
+    """Register a handler for callback_data starting with prefix."""
+    _CALLBACK_HANDLERS[prefix] = handler
+
+
+def dispatch_callback_query(token: str, agent: str, cfg: dict, cq: dict) -> None:
+    """Route a callback_query to the appropriate handler."""
+    data = cq.get("data", "")
+    for prefix, handler in _CALLBACK_HANDLERS.items():
+        if data.startswith(prefix):
+            try:
+                handler(token, agent, cfg, cq)
+            except Exception as e:
+                log.exception(f"callback handler error ({prefix}): {e}")
+                answer_callback_query(token, cq["id"], f"Error: {e}", show_alert=True)
+            return
+    # No handler matched -- acknowledge silently
+    answer_callback_query(token, cq["id"])
 
 
 # ---------------------------------------------------------------------------
@@ -1042,6 +1207,10 @@ def invoke_claude(
     timeout_sec = cfg.get("timeout_sec", 120)
     typing_cb = cfg.get("_typing_refresh_cb")
     status_cb = cfg.get("_status_update_cb")  # (status_text: str) -> None
+    streaming_mode = cfg.get("streaming_mode", "partial")  # off | partial | progress
+    # In "off" mode, disable status updates (no edit-in-place preview)
+    if streaming_mode == "off":
+        status_cb = None
     tracker = _TaskBoundaryTracker(status_cb) if status_cb else None
     t0 = time.time()
     last_activity = t0  # heartbeat: reset on every event from Claude
@@ -1709,17 +1878,18 @@ def record_heartbeat(
 
 def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: list[int]) -> None:
     """Handle one Telegram update. Ignore non-message / non-allowlisted / non-addressed."""
+    is_webhook = update.get("_webhook", False)
     msg = update.get("message") or update.get("channel_post")
     if not msg:
         return
     user_id = (msg.get("from") or {}).get("id")
-    if user_id not in allowlist:
+    if not is_webhook and user_id not in allowlist:
         log.info(f"denied user_id={user_id} agent={agent}")
         return
 
     # Group-chat gating: only respond if addressed via @mention, name, or reply
     bot_username = cfg.get("_bot_username")
-    if not is_addressed_to_agent(agent, msg, bot_username, cfg):
+    if not is_webhook and not is_addressed_to_agent(agent, msg, bot_username, cfg):
         chat_type = (msg.get("chat") or {}).get("type", "?")
         log.info(f"[{agent}] group chat {chat_type}, not addressed, skip")
         return
@@ -1763,7 +1933,12 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
                 fname = media_ref.get("file_name") or local.name
                 media_note = f"\n\n[File {fname}: {local}] -- read via Read tool (for PDF use pypdf or shell pdftotext)"
             elif mtype == "sticker":
-                media_note = f"\n\n[Sticker: {local}]"
+                sticker_obj = msg.get("sticker") or {}
+                sticker_emoji = sticker_obj.get("emoji", "")
+                sticker_set = sticker_obj.get("set_name", "")
+                sticker_uid = sticker_obj.get("file_unique_id", "")
+                desc = _get_sticker_description(sticker_uid, sticker_emoji, sticker_set, local)
+                media_note = f"\n\n[Sticker: {desc}]"
         else:
             media_note = f"\n\n[Failed to download {media_ref['type']} (possibly >20MB)]"
 
@@ -1773,8 +1948,16 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
         text = "(user sent attachment)"
     text = text + media_note
 
+    # Ack reaction: eyes emoji to show message is being processed
+    if message_id:
+        set_reaction(token, chat_id, message_id, "\U0001f440")
+
     # Prepend source tag for OV memory extraction (invisible to agent context, used by gateway OV push)
     text_for_agent = text  # what agent sees
+    # Forward context: agent sees who forwarded the message
+    if source_tag == "forwarded":
+        fwd_name = source_label.replace("forwarded from: ", "")
+        text_for_agent = f"[Forwarded from: {fwd_name}]\n{text}"
     text_for_ov = f"[source:{source_tag} | {source_label}]\n{text}"
 
     log.info(f"[{agent}] chat={chat_id} user={user_id} src={source_tag}: {text[:100]}")
@@ -2014,6 +2197,12 @@ def polling_producer(
             new_offset = upd["update_id"] + 1
             offset_file.write_text(str(new_offset))
 
+            # Handle callback queries (inline button presses)
+            cq = upd.get("callback_query")
+            if cq:
+                dispatch_callback_query(token, agent, cfg, cq)
+                continue
+
             msg = upd.get("message") or upd.get("channel_post")
             if not msg:
                 continue
@@ -2024,6 +2213,17 @@ def polling_producer(
                     f"[{agent}] producer denied user_id={user_id}"
                 )
                 continue
+
+            # Per-topic routing: if agent has topic_routing config, only accept
+            # messages from specified topics in specified groups
+            topic_routing = cfg.get("topic_routing")
+            if topic_routing:
+                chat_id_str = str(msg["chat"]["id"])
+                thread_id = msg.get("message_thread_id")
+                if chat_id_str in topic_routing:
+                    allowed_topics = topic_routing[chat_id_str]
+                    if thread_id is None or str(thread_id) not in allowed_topics:
+                        continue  # message not in routed topic for this agent
 
             # Group-chat gating
             bot_username = cfg.get("_bot_username")
@@ -2095,6 +2295,109 @@ def message_consumer(
 
 
 # ---------------------------------------------------------------------------
+# Webhook API -- lightweight HTTP server for external triggers
+# ---------------------------------------------------------------------------
+
+from http.server import HTTPServer, BaseHTTPRequestHandler as _BaseHandler
+
+
+class _WebhookHandler(_BaseHandler):
+    """Handle POST /hooks/agent -- inject message into agent queue."""
+
+    # Set by main() before server starts
+    gateway_cfg: dict = {}
+    gateway_agents: dict = {}
+    webhook_token: str = ""
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        log.debug(f"[webhook] {fmt % args}")
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path != "/hooks/agent":
+            self._reply(404, {"error": "not found"})
+            return
+
+        # Auth check
+        auth = self.headers.get("Authorization", "")
+        expected = f"Bearer {self.webhook_token}" if self.webhook_token else ""
+        if self.webhook_token and auth != expected:
+            self._reply(401, {"error": "unauthorized"})
+            return
+
+        # Parse body
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+        except Exception:
+            self._reply(400, {"error": "invalid json"})
+            return
+
+        agent_id = body.get("agentId", "")
+        message = body.get("message", "")
+        if not agent_id or not message:
+            self._reply(400, {"error": "agentId and message required"})
+            return
+
+        if agent_id not in self.gateway_agents:
+            self._reply(404, {"error": f"agent '{agent_id}' not found"})
+            return
+
+        # Inject into agent queue as synthetic update
+        q = _MSG_QUEUES.get(agent_id)
+        if not q:
+            self._reply(503, {"error": f"agent '{agent_id}' queue not ready"})
+            return
+
+        # Build a synthetic Telegram-like update
+        chat_id = body.get("chatId") or body.get("to")
+        synthetic_msg = {
+            "message_id": 0,
+            "from": {"id": 0, "first_name": "webhook", "is_bot": False},
+            "chat": {"id": int(chat_id) if chat_id else 0, "type": "private"},
+            "date": int(time.time()),
+            "text": message,
+        }
+        q.put({"update_id": 0, "message": synthetic_msg, "_webhook": True})
+        log.info(f"[webhook] injected message for {agent_id}: {message[:80]}")
+        self._reply(200, {"ok": True, "agent": agent_id})
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/health":
+            agents_status = {
+                a: "online" for a in self.gateway_agents
+            }
+            self._reply(200, {"status": "ok", "agents": agents_status})
+        else:
+            self._reply(404, {"error": "not found"})
+
+    def _reply(self, code: int, data: dict) -> None:
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def _start_webhook_server(
+    cfg: dict, agents: dict, port: int, token: str
+) -> None:
+    """Start webhook HTTP server in daemon thread."""
+    _WebhookHandler.gateway_cfg = cfg
+    _WebhookHandler.gateway_agents = agents
+    _WebhookHandler.webhook_token = token
+
+    server = HTTPServer(("127.0.0.1", port), _WebhookHandler)
+    t = threading.Thread(
+        target=server.serve_forever,
+        name="webhook-server",
+        daemon=True,
+    )
+    t.start()
+    log.info(f"[webhook] HTTP server on 127.0.0.1:{port}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -2118,6 +2421,12 @@ def main() -> None:
         f"gateway started (producer-consumer), "
         f"agents={list(agents.keys())}, allowlist={allowlist}"
     )
+
+    # Start webhook API server (optional)
+    webhook_port = cfg.get("webhook_port", 0)
+    if webhook_port:
+        webhook_token = cfg.get("webhook_token", "")
+        _start_webhook_server(cfg, agents, webhook_port, webhook_token)
 
     offsets = {a: STATE_DIR / f"offset-{a}.txt" for a in agents}
     threads: list[threading.Thread] = []

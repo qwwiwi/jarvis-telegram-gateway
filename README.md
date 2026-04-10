@@ -10,12 +10,19 @@ Universal Telegram gateway for autonomous Claude Code agents. Connect your AI ag
 - **Media handling** -- photos, videos, documents, forwarded messages
 - **Session persistence** -- multi-turn conversations via `claude --resume`
 - **Real-time progress** -- live status updates in Telegram (tool calls, subagents, plan)
-- **Hot memory** -- rolling 72h journal, auto-trim
+- **Hot memory** -- rolling 24h journal, auto-trim
 - **[OpenViking](https://github.com/volcengine/OpenViking) integration** -- semantic memory extraction (optional)
 - **Producer-consumer architecture** -- non-blocking `/stop`, `/status` commands
 - **Markdown to HTML** -- tables, code blocks, bold, links
 - **Multi-agent support** -- run multiple agents from one gateway
 - **Group chat support** -- @mention routing
+- **Forward context** -- agent sees who forwarded the message (`[Forwarded from: Name]`)
+- **Message reactions** -- eyes emoji on received messages (ack)
+- **Inline buttons** -- send messages with inline keyboard, callback query dispatch
+- **Sticker cache** -- cached descriptions for repeated stickers (emoji + set name)
+- **Webhook API** -- HTTP endpoint (`POST /hooks/agent`) for external message injection
+- **Per-topic routing** -- route group-chat forum topics to specific agents
+- **Streaming modes** -- configurable live preview: `off` / `partial` / `progress`
 
 ## Quick Start
 
@@ -114,6 +121,8 @@ sudo systemctl enable --now jarvis-gateway
 |-------|------|-------------|
 | `poll_interval_sec` | int | Telegram polling interval (default: 2) |
 | `allowlist_user_ids` | int[] | Telegram user IDs allowed to use the bot |
+| `webhook_port` | int | HTTP webhook server port (0 = disabled) |
+| `webhook_token` | string | Bearer token for webhook auth (optional) |
 | `agents` | object | Agent configurations (see below) |
 
 ### Agent config
@@ -131,6 +140,9 @@ sudo systemctl enable --now jarvis-gateway
 | `groq_api_key_file` | string | -- | Alternative: read key from file |
 | `openviking_url` | string | -- | OpenViking API URL (optional) |
 | `openviking_key_file` | string | -- | OpenViking API key file (optional) |
+| `streaming_mode` | string | "partial" | Live preview mode: `off` / `partial` / `progress` |
+| `agent_names` | string[] | [agent_key] | Name aliases for group-chat mention detection |
+| `topic_routing` | object | {} | Per-topic routing: `{"-100123": ["42", "99"]}` |
 
 ### Environment variables (alternative to config)
 
@@ -151,6 +163,44 @@ export TELEGRAM_BOT_TOKEN=123456:ABC...
 | `/compact` | Manually compact hot memory |
 | `/help` | Show command list |
 
+## Webhook API
+
+External systems can inject messages into agents via HTTP:
+
+```bash
+curl -X POST http://127.0.0.1:9090/hooks/agent \
+  -H "Authorization: Bearer your-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{"agentId": "jarvis", "message": "Deploy completed", "chatId": 123456789}'
+```
+
+Health check: `GET /health` returns agent status.
+
+Enable in config: `"webhook_port": 9090, "webhook_token": "your-secret-token"`.
+
+## Per-topic Routing
+
+Route forum topics in group chats to specific agents:
+
+```json
+{
+  "agents": {
+    "jarvis": {
+      "topic_routing": {
+        "-1001234567890": ["42"]
+      }
+    },
+    "homer": {
+      "topic_routing": {
+        "-1001234567890": ["99"]
+      }
+    }
+  }
+}
+```
+
+Topic `42` in group `-1001234567890` goes to Jarvis, topic `99` goes to Homer.
+
 ## Architecture
 
 ```
@@ -170,7 +220,7 @@ Telegram
     ├── invoke claude -p --resume <session_id>
     ├── stream progress (edit status message)
     ├── send response (markdown -> HTML)
-    ├── append to hot memory (rolling 72h)
+    ├── append to hot memory (rolling 24h)
     └── push to OpenViking (semantic, optional)
 ```
 

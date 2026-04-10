@@ -3,6 +3,8 @@
   "_note": "Agent names (jarvis, homer, edith) are EXAMPLES. Replace with your own.",
   "poll_interval_sec": 2,
   "allowlist_user_ids": [123456789],
+  "webhook_port": 0,
+  "webhook_token": "",
   "agents": {
     "jarvis": {
       "_role": "coordinator -- routes tasks, manages agents",
@@ -11,10 +13,13 @@
       "workspace": "/home/user/.claude-lab/jarvis/.claude",
       "model": "opus",
       "timeout_sec": 120,
+      "streaming_mode": "partial",
       "system_reminder": "You are a coordinator agent.",
       "groq_api_key_file": "/path/to/shared/secrets/groq-api-key",
       "openviking_url": "http://127.0.0.1:1933",
-      "openviking_key_file": "/path/to/shared/secrets/openviking.key"
+      "openviking_key_file": "/path/to/shared/secrets/openviking.key",
+      "agent_names": ["jarvis", "джарвис"],
+      "topic_routing": {}
     },
     "homer": {
       "_role": "coder -- writes code, tests, deploys",
@@ -23,10 +28,13 @@
       "workspace": "/home/user/.claude-lab/homer/.claude",
       "model": "opus",
       "timeout_sec": 300,
+      "streaming_mode": "partial",
       "system_reminder": "You are a coder agent.",
       "groq_api_key_file": "/path/to/shared/secrets/groq-api-key",
       "openviking_url": "http://127.0.0.1:1933",
-      "openviking_key_file": "/path/to/shared/secrets/openviking.key"
+      "openviking_key_file": "/path/to/shared/secrets/openviking.key",
+      "agent_names": ["homer", "хомер"],
+      "topic_routing": {}
     },
     "edith": {
       "_role": "inbox -- receives info, organizes knowledge",
@@ -35,10 +43,13 @@
       "workspace": "/home/user/.claude-lab/edith/.claude",
       "model": "sonnet",
       "timeout_sec": 120,
+      "streaming_mode": "partial",
       "system_reminder": "You are a knowledge management agent.",
       "groq_api_key_file": "/path/to/shared/secrets/groq-api-key",
       "openviking_url": "http://127.0.0.1:1933",
-      "openviking_key_file": "/path/to/shared/secrets/openviking.key"
+      "openviking_key_file": "/path/to/shared/secrets/openviking.key",
+      "agent_names": ["edith", "эдит"],
+      "topic_routing": {}
     }
   }
 }
