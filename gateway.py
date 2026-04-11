@@ -2475,49 +2475,6 @@ def polling_producer(
                     _push_group_message_to_ov, agent, cfg, msg
                 )
 
-            # Group voice: transcribe, then decide — respond or just transcript
-            if is_group:
-                voice_user_id = (msg.get("from") or {}).get("id")
-                has_voice = (
-                    msg.get("voice")
-                    or msg.get("audio")
-                    or msg.get("video_note")
-                )
-                if has_voice and voice_user_id in allowlist:
-                    try:
-                        voice_obj = (
-                            msg.get("voice")
-                            or msg.get("audio")
-                            or msg.get("video_note")
-                        )
-                        local_path = download_telegram_file(
-                            token, voice_obj["file_id"], "voice", None,
-                        )
-                        transcript = ""
-                        if local_path:
-                            transcript = (
-                                transcribe_audio(local_path, agent_cfg=cfg)
-                                or ""
-                            ).strip()
-                        if transcript:
-                            # Always reply with italic transcript
-                            tg_api(
-                                token, "sendMessage",
-                                chat_id=msg["chat"]["id"],
-                                text=f"<i>{escape_html(transcript)}</i>",
-                                parse_mode="HTML",
-                                reply_to_message_id=msg["message_id"],
-                                allow_sending_without_reply=True,
-                            )
-                            # Inject transcript so is_addressed_to_agent can check it
-                            msg["_voice_transcript"] = transcript
-                            log.info(
-                                f"[{agent}] group voice transcribed, "
-                                f"len={len(transcript)}"
-                            )
-                    except Exception:
-                        log.exception(f"[{agent}] group voice transcribe failed")
-
             user_id = (msg.get("from") or {}).get("id")
             if user_id not in allowlist:
                 log.info(
