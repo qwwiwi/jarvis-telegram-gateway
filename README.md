@@ -15,7 +15,7 @@ Universal Telegram gateway for autonomous Claude Code agents. Connect your AI ag
 - **Producer-consumer architecture** -- non-blocking `/stop`, `/status` commands
 - **Markdown to HTML** -- tables, code blocks, bold, links
 - **Multi-agent support** -- run multiple agents from one gateway
-- **Group chat support** -- @mention routing
+- **Group chat support** -- @mention routing, group allowlist, group-to-OpenViking logging
 - **Forward context** -- agent sees who forwarded the message (`[Forwarded from: Name]`)
 - **Message reactions** -- eyes emoji on received messages (ack)
 - **Inline buttons** -- send messages with inline keyboard, callback query dispatch
@@ -121,6 +121,7 @@ sudo systemctl enable --now jarvis-gateway
 |-------|------|-------------|
 | `poll_interval_sec` | int | Telegram polling interval (default: 2) |
 | `allowlist_user_ids` | int[] | Telegram user IDs allowed to use the bot |
+| `allowlist_group_ids` | int[] | Telegram group chat IDs where bots can operate (empty = no groups) |
 | `webhook_port` | int | HTTP webhook server port (0 = disabled) |
 | `webhook_token` | string | Bearer token for webhook auth (optional) |
 | `agents` | object | Agent configurations (see below) |
@@ -147,6 +148,7 @@ sudo systemctl enable --now jarvis-gateway
 | `streaming_mode` | string | "partial" | Live preview mode: `off` / `partial` / `progress` |
 | `agent_names` | string[] | [agent_key] | Name aliases for group-chat mention detection |
 | `topic_routing` | object | {} | Per-topic routing: `{"-100123": ["42", "99"]}` |
+| `group_log_ov_user` | string | "" | OpenViking user for group chat logging (empty = disabled) |
 
 ### Environment variables (alternative to config)
 
@@ -253,6 +255,97 @@ All new fields are optional. If not set:
 - `system_reminder_group` uses the built-in default (concise public rules)
 
 Existing configs without these fields work exactly as before.
+
+## Group Allowlist
+
+Control which groups the bot can operate in:
+
+```json
+{
+  "allowlist_user_ids": [123456789],
+  "allowlist_group_ids": [-1001234567890],
+  "agents": { ... }
+}
+```
+
+### How it works
+
+- **DM (private chat):** checked against `allowlist_user_ids` only (unchanged)
+- **Group/supergroup:** message must pass TWO checks:
+  1. `chat_id` in `allowlist_group_ids`
+  2. `user_id` in `allowlist_user_ids`
+- **Empty `allowlist_group_ids`** (default): bot does not operate in any groups
+
+The bot still only **responds** when addressed (@mention, name, reply). The allowlist controls which groups the bot is allowed to work in at all.
+
+### Setup
+
+1. Disable Group Privacy in @BotFather: `/mybots` -> Bot Settings -> Group Privacy -> Turn OFF
+2. Add the bot to your group
+3. Get the group's `chat_id` (negative number starting with `-100`)
+4. Add it to `allowlist_group_ids` in config
+5. Restart gateway
+
+## Group Chat Logging (OpenViking)
+
+Log ALL messages from allowlisted groups to OpenViking for semantic search and history.
+
+### How it works
+
+Every message in an allowlisted group is pushed to OpenViking under a separate user namespace (e.g. `my-group-chat`), keeping group logs isolated from agent conversation memories.
+
+```
+Group message -> gateway receives -> push to OV (fire-and-forget)
+                                  -> if addressed to agent: also process normally
+```
+
+Each message is logged with: sender name, username, text, links, media type, reply context.
+
+### Configuration
+
+```json
+{
+  "allowlist_group_ids": [-1001234567890],
+  "agents": {
+    "jarvis": {
+      "group_log_ov_user": "my-group-chat",
+      "openviking_url": "http://localhost:1933",
+      "openviking_key_file": "/path/to/ov.key",
+      "openviking_account": "default"
+    }
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `group_log_ov_user` | OV user namespace for group logs. Empty = logging disabled. |
+| `openviking_url` | OpenViking API endpoint (required) |
+| `openviking_key_file` | Path to API key file (required) |
+
+### Searching group history
+
+```bash
+curl -X POST "http://localhost:1933/api/v1/search/find" \
+  -H "X-API-Key: $KEY" \
+  -H "X-OpenViking-Account: default" \
+  -H "X-OpenViking-User: my-group-chat" \
+  -d '{"query": "links shared last week", "limit": 20}'
+```
+
+### What gets logged
+
+- All users' messages (not just allowlisted -- full group context)
+- Text, captions, links (from entities)
+- Media indicators: `[Photo]`, `[Video]`, `[Voice]`, `[Document]`, `[Sticker]`
+- Reply context: quoted text from replied-to message
+- Sender: full name + @username
+
+### What does NOT happen
+
+- Bot does not **respond** to non-allowlisted users (allowlist_user_ids still applies)
+- Group logs go to a **separate** OV namespace -- they don't pollute agent memories
+- Logging is fire-and-forget -- failures don't block the gateway
 
 ## Architecture
 
