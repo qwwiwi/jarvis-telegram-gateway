@@ -3,6 +3,7 @@
   "_note": "Agent names (jarvis, homer, edith) are EXAMPLES. Replace with your own.",
   "poll_interval_sec": 2,
   "allowlist_user_ids": [123456789],
+  "allowlist_group_ids": [],
   "webhook_port": 0,
   "webhook_token": "",
   "agents": {

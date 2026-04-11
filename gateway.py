@@ -1888,6 +1888,19 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
     msg = update.get("message") or update.get("channel_post")
     if not msg:
         return
+
+    # Group/supergroup gating: check chat_id against allowlist_group_ids
+    chat_type = (msg.get("chat") or {}).get("type", "private")
+    is_group = chat_type in ("group", "supergroup")
+    if not is_webhook and is_group:
+        chat_id_check = msg["chat"]["id"]
+        allowlist_groups = cfg.get("_allowlist_group_ids", [])
+        if chat_id_check not in allowlist_groups:
+            log.info(
+                f"[{agent}] denied group chat_id={chat_id_check}"
+            )
+            return
+
     user_id = (msg.get("from") or {}).get("id")
     if not is_webhook and user_id not in allowlist:
         log.info(f"denied user_id={user_id} agent={agent}")
@@ -2258,6 +2271,19 @@ def polling_producer(
             if not msg:
                 continue
 
+            # Group/supergroup gating: check chat_id against allowlist_group_ids
+            chat_type = (msg.get("chat") or {}).get("type", "private")
+            is_group = chat_type in ("group", "supergroup")
+            if is_group:
+                group_chat_id = msg["chat"]["id"]
+                allowlist_groups = cfg.get("_allowlist_group_ids", [])
+                if group_chat_id not in allowlist_groups:
+                    log.info(
+                        f"[{agent}] producer denied group "
+                        f"chat_id={group_chat_id}"
+                    )
+                    continue
+
             user_id = (msg.get("from") or {}).get("id")
             if user_id not in allowlist:
                 log.info(
@@ -2460,6 +2486,7 @@ def main() -> None:
 
     cfg = json.loads(CONFIG_PATH.read_text())
     allowlist = cfg.get("allowlist_user_ids", [])
+    allowlist_groups = cfg.get("allowlist_group_ids", [])
     agents = {
         k: v for k, v in cfg["agents"].items() if v.get("enabled")
     }
@@ -2470,7 +2497,8 @@ def main() -> None:
 
     log.info(
         f"gateway started (producer-consumer), "
-        f"agents={list(agents.keys())}, allowlist={allowlist}"
+        f"agents={list(agents.keys())}, allowlist={allowlist}, "
+        f"allowlist_groups={allowlist_groups}"
     )
 
     # Start webhook API server (optional)
@@ -2483,6 +2511,9 @@ def main() -> None:
     threads: list[threading.Thread] = []
 
     for agent, acfg in agents.items():
+        # Inject group allowlist into per-agent config for access in handlers
+        acfg["_allowlist_group_ids"] = allowlist_groups
+
         # Initialize per-agent message queue
         _MSG_QUEUES[agent] = queue.Queue()
 
