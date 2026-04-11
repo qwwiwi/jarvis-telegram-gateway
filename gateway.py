@@ -668,7 +668,10 @@ def is_addressed_to_agent(agent: str, msg: dict, bot_username: str | None, cfg: 
         return True  # DM -- always address
 
     # Group/supergroup -- need explicit mention or name
-    text = (msg.get("text") or msg.get("caption") or "").lower()
+    text = (
+        msg.get("text") or msg.get("caption")
+        or msg.get("_voice_transcript") or ""
+    ).lower()
     if not text:
         return False
 
@@ -2115,8 +2118,10 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
         if local:
             mtype = media_ref["type"]
             if mtype in ("voice", "audio", "video_note"):
-                # Transcribe via Groq (video_note has audio track)
-                transcript = transcribe_audio(local, agent_cfg=cfg)
+                # Use pre-transcribed text from producer if available
+                transcript = msg.get("_voice_transcript") or ""
+                if not transcript:
+                    transcript = transcribe_audio(local, agent_cfg=cfg) or ""
                 if transcript:
                     media_note = f"\n\n[Voice/audio transcript]: {transcript}"
                 else:
@@ -2470,9 +2475,7 @@ def polling_producer(
                     _push_group_message_to_ov, agent, cfg, msg
                 )
 
-            # Auto-transcribe voice in allowlisted groups
-            # from allowlisted users (fire-and-forget, does not
-            # block or replace normal message processing)
+            # Group voice: transcribe, then decide — respond or just transcript
             if is_group:
                 voice_user_id = (msg.get("from") or {}).get("id")
                 has_voice = (
@@ -2481,10 +2484,39 @@ def polling_producer(
                     or msg.get("video_note")
                 )
                 if has_voice and voice_user_id in allowlist:
-                    _OV_POOL.submit(
-                        _auto_transcribe_group_voice,
-                        agent, cfg, token, msg,
-                    )
+                    try:
+                        voice_obj = (
+                            msg.get("voice")
+                            or msg.get("audio")
+                            or msg.get("video_note")
+                        )
+                        local_path = download_telegram_file(
+                            token, voice_obj["file_id"], "voice", None,
+                        )
+                        transcript = ""
+                        if local_path:
+                            transcript = (
+                                transcribe_audio(local_path, agent_cfg=cfg)
+                                or ""
+                            ).strip()
+                        if transcript:
+                            # Always reply with italic transcript
+                            tg_api(
+                                token, "sendMessage",
+                                chat_id=msg["chat"]["id"],
+                                text=f"<i>{escape_html(transcript)}</i>",
+                                parse_mode="HTML",
+                                reply_to_message_id=msg["message_id"],
+                                allow_sending_without_reply=True,
+                            )
+                            # Inject transcript so is_addressed_to_agent can check it
+                            msg["_voice_transcript"] = transcript
+                            log.info(
+                                f"[{agent}] group voice transcribed, "
+                                f"len={len(transcript)}"
+                            )
+                    except Exception:
+                        log.exception(f"[{agent}] group voice transcribe failed")
 
             user_id = (msg.get("from") or {}).get("id")
             if user_id not in allowlist:
