@@ -113,6 +113,17 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now jarvis-gateway
 ```
 
+**Important: file permissions.** The gateway runs as the `User` specified in the service file. All secret files (bot tokens, API keys, OV keys) must be readable by that user:
+
+```bash
+# If your service runs as 'myuser', ensure ownership:
+chown myuser:myuser /path/to/secrets/*
+chmod 600 /path/to/secrets/*
+
+# Common mistake: copying secrets via scp/sudo creates root-owned files
+# that the service user cannot read, causing silent auth failures.
+```
+
 ## Configuration
 
 ### config.json
