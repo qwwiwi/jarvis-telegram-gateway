@@ -1864,6 +1864,126 @@ def push_to_openviking(agent: str, cfg: dict, user_text: str, agent_response: st
                 pass
 
 
+def _push_group_message_to_ov(agent: str, cfg: dict, msg: dict) -> None:
+    """Push a group chat message to OpenViking for semantic logging.
+
+    Fire-and-forget via _OV_POOL. Uses a separate OV user namespace
+    (configured via 'group_log_ov_user' in agent config) so group
+    messages don't mix with agent conversation memories.
+    """
+    try:
+        ov_url = cfg.get("openviking_url")
+        if not ov_url:
+            return
+        ov_key_file = cfg.get("openviking_key_file")
+        if not ov_key_file:
+            return
+        key_path = Path(expand(ov_key_file))
+        if not key_path.exists():
+            return
+        key = key_path.read_text().strip()
+        ov_account = cfg.get("openviking_account", "default")
+        ov_user = cfg.get("group_log_ov_user", "")
+        if not ov_user:
+            return  # feature disabled
+
+        headers = {
+            "X-API-Key": key,
+            "X-OpenViking-Account": ov_account,
+            "X-OpenViking-User": ov_user,
+            "Content-Type": "application/json",
+        }
+        base = f"{ov_url.rstrip('/')}/api/v1"
+
+        # Format message content
+        from_user = msg.get("from") or {}
+        sender_name = (
+            from_user.get("first_name", "")
+            + (" " + from_user.get("last_name", "") if from_user.get("last_name") else "")
+        ).strip() or "Unknown"
+        username = from_user.get("username", "")
+        text = (msg.get("text") or msg.get("caption") or "").strip()
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(msg.get("date", 0)))
+
+        # Build formatted content
+        lines = [
+            f"[EdgeLab Chat] {ts}",
+            f"From: {sender_name}" + (f" (@{username})" if username else ""),
+        ]
+        if text:
+            lines.append(text)
+
+        # Detect links in entities
+        entities = msg.get("entities") or msg.get("caption_entities") or []
+        links = []
+        raw_text = msg.get("text") or msg.get("caption") or ""
+        for ent in entities:
+            if ent.get("type") == "url":
+                url = raw_text[ent["offset"]:ent["offset"] + ent["length"]]
+                links.append(url)
+            elif ent.get("type") == "text_link":
+                links.append(ent.get("url", ""))
+        if links:
+            lines.append("Links: " + ", ".join(links))
+
+        # Media type indicators
+        media_types = []
+        if msg.get("photo"):
+            media_types.append("[Photo]")
+        if msg.get("video"):
+            media_types.append("[Video]")
+        if msg.get("voice") or msg.get("audio"):
+            media_types.append("[Voice]")
+        if msg.get("document"):
+            media_types.append("[Document]")
+        if msg.get("sticker"):
+            media_types.append("[Sticker]")
+        if media_types:
+            lines.append(" ".join(media_types))
+
+        # Reply context
+        reply_msg = msg.get("reply_to_message")
+        if reply_msg:
+            quoted = (reply_msg.get("text") or reply_msg.get("caption") or "")[:100]
+            if quoted:
+                lines.append(f'Re: "{quoted}"')
+
+        content = "\n".join(lines)
+
+        # OV session: create -> add message -> extract -> cleanup
+        sid = None
+        r = requests.post(f"{base}/sessions", headers=headers, json={}, timeout=10)
+        if r.status_code != 200:
+            log.warning(f"[ov-group] create session failed: {r.status_code}")
+            return
+        sid = r.json().get("result", {}).get("session_id")
+        if not sid:
+            return
+        try:
+            requests.post(
+                f"{base}/sessions/{sid}/messages",
+                headers=headers,
+                json={"role": "user", "content": content[:3000]},
+                timeout=10,
+            )
+            ext = requests.post(
+                f"{base}/sessions/{sid}/extract",
+                headers=headers, json={}, timeout=60,
+            )
+            extracted = ext.json().get("result", []) if ext.status_code == 200 else []
+            log.info(
+                f"[ov-group] extracted {len(extracted)} memories "
+                f"from {sender_name} in chat {msg['chat']['id']}"
+            )
+        finally:
+            try:
+                requests.delete(f"{base}/sessions/{sid}", headers=headers, timeout=5)
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning(f"[ov-group] push failed for agent={agent}: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Heartbeat (no-op / log-only, no external dependencies)
 # ---------------------------------------------------------------------------
@@ -2283,6 +2403,14 @@ def polling_producer(
                         f"chat_id={group_chat_id}"
                     )
                     continue
+
+            # Log ALL messages from allowlisted groups to OpenViking
+            # (fire-and-forget, before user_id check -- logs even
+            # non-allowlisted users' messages for group context)
+            if is_group and cfg.get("group_log_ov_user"):
+                _OV_POOL.submit(
+                    _push_group_message_to_ov, agent, cfg, msg
+                )
 
             user_id = (msg.get("from") or {}).get("id")
             if user_id not in allowlist:
