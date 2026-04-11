@@ -1199,6 +1199,12 @@ def invoke_claude(
         "--permission-mode",
         "bypassPermissions",
     ]
+
+    # Inject system reminder via --append-system-prompt (if configured)
+    active_reminder = cfg.get("_active_system_reminder", "")
+    if active_reminder:
+        cmd.extend(["--append-system-prompt", active_reminder])
+
     if is_first:
         cmd.extend(["--session-id", sid])
     else:
@@ -1960,6 +1966,49 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
         text_for_agent = f"[Forwarded from: {fwd_name}]\n{text}"
     text_for_ov = f"[source:{source_tag} | {source_label}]\n{text}"
 
+    # -----------------------------------------------------------------------
+    # Group vs Private: choose streaming mode and system reminder per context
+    # -----------------------------------------------------------------------
+    chat_type = (msg.get("chat") or {}).get("type", "private")
+    is_group = chat_type in ("group", "supergroup")
+
+    if is_group:
+        streaming_mode = cfg.get(
+            "streaming_mode_group",
+            cfg.get("streaming_mode", "off"),
+        )
+    else:
+        streaming_mode = cfg.get(
+            "streaming_mode_private",
+            cfg.get("streaming_mode", "partial"),
+        )
+
+    _DEFAULT_GROUP_REMINDER = (
+        "You are in a PUBLIC group chat. Rules:\n"
+        "1. Answer concisely -- result only, no process\n"
+        "2. Do NOT show: commands, file paths, logs, intermediate steps\n"
+        "3. Do NOT reveal: private data, API keys, internal architecture\n"
+        "4. Keep response under 500 characters unless asked for detail\n"
+        "5. No code blocks unless specifically requested"
+    )
+    if is_group:
+        active_reminder = cfg.get("system_reminder_group", "")
+        if not active_reminder:
+            active_reminder = _DEFAULT_GROUP_REMINDER
+    else:
+        active_reminder = cfg.get(
+            "system_reminder_private",
+            cfg.get("system_reminder", ""),
+        )
+
+    # Group context: prepend chat title and sender name so agent knows the source
+    if is_group:
+        chat_title = (msg.get("chat") or {}).get("title", "unknown")
+        sender = (msg.get("from") or {}).get("first_name", "unknown")
+        text_for_agent = (
+            f"[Group: {chat_title} | From: {sender}]\n{text_for_agent}"
+        )
+
     log.info(f"[{agent}] chat={chat_id} user={user_id} src={source_tag}: {text[:100]}")
 
     started_ms = int(time.time() * 1000)
@@ -1989,6 +2038,8 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
 
     invoke_cfg = {
         **cfg,
+        "streaming_mode": streaming_mode,
+        "_active_system_reminder": active_reminder,
         "_typing_refresh_cb": lambda: send_chat_action(token, chat_id, "typing"),
         "_status_update_cb": status_update,
     }

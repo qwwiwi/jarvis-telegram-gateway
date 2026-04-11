@@ -135,7 +135,11 @@ sudo systemctl enable --now jarvis-gateway
 | `workspace` | string | required | Path to agent's `.claude` directory |
 | `model` | string | "sonnet" | Claude model alias |
 | `timeout_sec` | int | 120 | Idle timeout before killing subprocess |
-| `system_reminder` | string | "" | System prompt injected into each turn |
+| `system_reminder` | string | "" | System prompt injected into each turn (fallback for private) |
+| `system_reminder_private` | string | `system_reminder` | System prompt for private (DM) chats |
+| `system_reminder_group` | string | (built-in) | System prompt for group chats (safe default if empty) |
+| `streaming_mode_private` | string | `streaming_mode` | Streaming mode for private chats |
+| `streaming_mode_group` | string | `streaming_mode` | Streaming mode for group chats |
 | `groq_api_key` | string | -- | Groq API key for voice transcription |
 | `groq_api_key_file` | string | -- | Alternative: read key from file |
 | `openviking_url` | string | -- | OpenViking API URL (optional) |
@@ -200,6 +204,55 @@ Route forum topics in group chats to specific agents:
 ```
 
 Topic `42` in group `-1001234567890` goes to Jarvis, topic `99` goes to Homer.
+
+## Group vs Private Modes
+
+The gateway automatically detects whether a message comes from a private DM or a group chat and adjusts behavior accordingly.
+
+### What changes in group mode
+
+| Aspect | Private (DM) | Group |
+|--------|-------------|-------|
+| Streaming mode | `streaming_mode_private` (default: `partial`) | `streaming_mode_group` (default: `off`) |
+| System reminder | `system_reminder_private` (fallback: `system_reminder`) | `system_reminder_group` (default: concise public-safe rules) |
+| Context prefix | None | `[Group: Chat Title \| From: Sender]` prepended |
+
+### Default group system reminder
+
+When `system_reminder_group` is not set, the gateway injects a safe default:
+
+```
+You are in a PUBLIC group chat. Rules:
+1. Answer concisely -- result only, no process
+2. Do NOT show: commands, file paths, logs, intermediate steps
+3. Do NOT reveal: private data, API keys, internal architecture
+4. Keep response under 500 characters unless asked for detail
+5. No code blocks unless specifically requested
+```
+
+### Configuration
+
+```json
+{
+  "agents": {
+    "jarvis": {
+      "streaming_mode_private": "progress",
+      "streaming_mode_group": "off",
+      "system_reminder_private": "",
+      "system_reminder_group": "You are in a PUBLIC group chat. Answer concisely."
+    }
+  }
+}
+```
+
+### Backward compatibility
+
+All new fields are optional. If not set:
+- `streaming_mode_private` / `streaming_mode_group` fall back to `streaming_mode`
+- `system_reminder_private` falls back to `system_reminder`
+- `system_reminder_group` uses the built-in default (concise public rules)
+
+Existing configs without these fields work exactly as before.
 
 ## Architecture
 
