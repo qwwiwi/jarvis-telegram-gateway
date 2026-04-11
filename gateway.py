@@ -1864,6 +1864,64 @@ def push_to_openviking(agent: str, cfg: dict, user_text: str, agent_response: st
                 pass
 
 
+def _auto_transcribe_group_voice(
+    agent: str, cfg: dict, token: str, msg: dict
+) -> None:
+    """Auto-transcribe voice/audio/video_note in allowlisted groups.
+
+    Downloads the file, transcribes via Groq Whisper, and replies with
+    the transcript as italic HTML. Fire-and-forget via _OV_POOL.
+    Does NOT interfere with normal message processing pipeline.
+    """
+    try:
+        voice = (
+            msg.get("voice")
+            or msg.get("audio")
+            or msg.get("video_note")
+        )
+        if not voice:
+            return
+        file_id = voice["file_id"]
+
+        # Download using existing helper
+        local_path = download_telegram_file(
+            token, file_id, "voice", None
+        )
+        if not local_path:
+            log.warning(
+                f"[{agent}] auto-transcribe: download failed"
+            )
+            return
+
+        # Transcribe using existing Groq Whisper helper
+        transcript = transcribe_audio(local_path, agent_cfg=cfg)
+        if not transcript or not transcript.strip():
+            log.info(
+                f"[{agent}] auto-transcribe: empty transcript"
+            )
+            return
+
+        # Reply to the original voice message with italic transcript
+        chat_id = msg["chat"]["id"]
+        message_id = msg["message_id"]
+        text = f"<i>{escape_html(transcript.strip())}</i>"
+        tg_api(
+            token, "sendMessage",
+            chat_id=chat_id,
+            text=text,
+            parse_mode="HTML",
+            reply_to_message_id=message_id,
+            allow_sending_without_reply=True,
+        )
+        log.info(
+            f"[{agent}] auto-transcribed voice in group {chat_id}"
+        )
+    except Exception:
+        log.exception(
+            f"[{agent}] auto-transcribe failed"
+        )
+
+
 def _push_group_message_to_ov(agent: str, cfg: dict, msg: dict) -> None:
     """Push a group chat message to OpenViking for semantic logging.
 
@@ -2411,6 +2469,22 @@ def polling_producer(
                 _OV_POOL.submit(
                     _push_group_message_to_ov, agent, cfg, msg
                 )
+
+            # Auto-transcribe voice in allowlisted groups
+            # from allowlisted users (fire-and-forget, does not
+            # block or replace normal message processing)
+            if is_group:
+                voice_user_id = (msg.get("from") or {}).get("id")
+                has_voice = (
+                    msg.get("voice")
+                    or msg.get("audio")
+                    or msg.get("video_note")
+                )
+                if has_voice and voice_user_id in allowlist:
+                    _OV_POOL.submit(
+                        _auto_transcribe_group_voice,
+                        agent, cfg, token, msg,
+                    )
 
             user_id = (msg.get("from") or {}).get("id")
             if user_id not in allowlist:
