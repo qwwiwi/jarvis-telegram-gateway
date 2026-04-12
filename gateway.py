@@ -1609,20 +1609,23 @@ class _TaskBoundaryTracker:
     def _render(self) -> None:
         if not self.status_cb:
             return
-        parts = []
         elapsed = int(time.time() - self._start_time)
-        parts.append(f"<code>working -- {elapsed}s</code>")
+        lines = [f"working -- {elapsed}s"]
         if self._thinking:
-            parts.append(f"<i>{escape_html(self._thinking)}</i>")
+            lines.append("")
+            lines.append(self._thinking)
         if self.tool_calls:
-            parts.append(self._render_activity())
+            lines.append("")
+            lines.append(self._render_activity())
         if self.todos:
-            parts.append(self._render_todos())
+            lines.append("")
+            lines.extend(self._render_todos())
         if self.dispatches:
-            parts.append(self._render_dispatches())
-        text = "\n\n".join(parts).strip()
-        if text:
-            self.status_cb(text)
+            lines.append("")
+            lines.extend(self._render_dispatches())
+        body = "\n".join(lines).strip()
+        if body:
+            self.status_cb(f"<pre>{escape_html(body)}</pre>")
 
     def _render_activity(self) -> str:
         """Single compact activity line instead of listing every tool call."""
@@ -1646,7 +1649,7 @@ class _TaskBoundaryTracker:
             "NotebookEdit": "editing notebook",
         }
         label = ACTIVITY_LABELS.get(name, name.lower())
-        return f"<code>▸</code> {label} ({total})"
+        return f"▸ {label} ({total})"
 
     def _render_todos(self) -> str:
         done = sum(1 for t in self.todos if t.get("status") == "completed")
@@ -1665,51 +1668,50 @@ class _TaskBoundaryTracker:
             visible.append((t, "pending"))
         if len(pending) > 2:
             visible.append(({"content": f"... +{len(pending) - 2} more"}, "skip"))
-        lines = [f"<code>{_progress_bar(done, total)}</code>"]
+        lines = [_progress_bar(done, total)]
         for t, st in visible:
-            content = escape_html((t.get("content") or "")[:60])
+            content = (t.get("content") or "")[:60]
             if st == "skip":
                 lines.append(f"  {content}")
             elif st == "completed":
-                lines.append(f"<code>[x]</code> <s>{content}</s>")
+                lines.append(f"  x {content}")
             elif st == "in_progress":
-                lines.append(f"<code>[&gt;]</code> <b>{content}</b>")
+                lines.append(f"  > {content}")
             else:
-                lines.append(f"<code>[ ]</code> {content}")
-        return "\n".join(lines)
+                lines.append(f"    {content}")
+        return lines
 
-    def _render_dispatches(self) -> str:
+    def _render_dispatches(self) -> list[str]:
         total = len(self.dispatches)
         single = total == 1
-        lines = [] if single else ["<b>steps:</b>"]
+        lines: list[str] = [] if single else ["steps:"]
         for i, d in enumerate(self.dispatches[-4:], start=max(1, total - 3)):
-            label = escape_html(d["label"])
+            label = d["label"]
             status = d["status"]
             if single:
-                # Single dispatch -- no number, just label with status
                 if status == "done":
-                    summary = escape_html(d.get("summary", "")[:30])
+                    summary = (d.get("summary", "") or "")[:30]
                     marker = f" -- {summary}" if summary else ""
-                    lines.append(f"<s>{label}</s>{marker}")
+                    lines.append(f"x {label}{marker}")
                 elif status == "running":
-                    desc = escape_html(d.get("desc", "")[:40])
+                    desc = (d.get("desc", "") or "")[:40]
                     desc_part = f" -- {desc}" if desc else ""
-                    lines.append(f"<b>{label}</b>{desc_part}")
+                    lines.append(f"> {label}{desc_part}")
             else:
                 if status == "done":
-                    summary = escape_html(d.get("summary", "")[:30])
-                    marker = "" if not summary else f" -- <i>{summary}</i>"
-                    lines.append(f" {i:>2} | <s>{label}</s>{marker}")
+                    summary = (d.get("summary", "") or "")[:30]
+                    marker = f" -- {summary}" if summary else ""
+                    lines.append(f" {i:>2} | x {label}{marker}")
                 elif status == "running":
-                    desc = escape_html(d.get("desc", "")[:40])
+                    desc = (d.get("desc", "") or "")[:40]
                     desc_part = f" -- {desc}" if desc else ""
-                    lines.append(f" {i:>2} | <b>{label}</b>{desc_part}  <- now")
+                    lines.append(f" {i:>2} | > {label}{desc_part}")
                 else:
-                    lines.append(f" {i:>2} | {label}")
+                    lines.append(f" {i:>2} |   {label}")
         done = sum(1 for d in self.dispatches if d["status"] == "done")
         if total > 1:
-            lines.append(f"\n<code>{_progress_bar(done, total)}</code>")
-        return "\n".join(lines)
+            lines.append(_progress_bar(done, total))
+        return lines
 
     @staticmethod
     def _truncate_thinking(text: str, max_lines: int = 2, max_chars: int = 140) -> str:
