@@ -23,6 +23,17 @@ gateway.log
 *.swp
 *.swo
 
+# Backup files from gateway edits
+*.bak.*
+
+# Session state
+sid-*.txt
+
+# Logs
+*.log
+/tmp/
+
 # OS
 .DS_Store
 Thumbs.db
+._*

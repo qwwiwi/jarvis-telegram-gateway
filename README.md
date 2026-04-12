@@ -1,5 +1,7 @@
 # Jarvis Telegram Gateway
 
+> Compatible with [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (Anthropic)
+
 Universal Telegram gateway for autonomous Claude Code agents. Connect your AI agent to Telegram with voice transcription, session management, real-time progress display, and semantic memory.
 
 > **NOTE:** Agent names (Jarvis, Homer, Edith) are **examples**. Replace them with your own names when copying this setup.
@@ -9,7 +11,7 @@ Universal Telegram gateway for autonomous Claude Code agents. Connect your AI ag
 - **Voice messages** -- [Groq](https://groq.com) Whisper transcription (Russian + English)
 - **Media handling** -- photos, videos, documents, forwarded messages
 - **Session persistence** -- multi-turn conversations via `claude --resume`
-- **Real-time progress** -- live status updates in Telegram (tool calls, subagents, plan)
+- **Real-time progress** -- live status updates in Telegram (thinking, activity, plan, subagents)
 - **Hot memory** -- rolling 24h journal, auto-trim
 - **[OpenViking](https://github.com/volcengine/OpenViking) integration** -- semantic memory extraction (optional)
 - **Producer-consumer architecture** -- non-blocking `/stop`, `/status` commands
@@ -62,7 +64,7 @@ Edit `config.json` (example shows 3 agents -- use as many as you need):
   "agents": {
     "jarvis": {
       "enabled": true,
-      "telegram_bot_token": "YOUR_JARVIS_BOT_TOKEN",
+      "telegram_bot_token_file": "~/.claude-lab/jarvis/secrets/telegram-bot-token",
       "workspace": "~/.claude-lab/jarvis/.claude",
       "model": "opus",
       "timeout_sec": 120,
@@ -70,7 +72,7 @@ Edit `config.json` (example shows 3 agents -- use as many as you need):
     },
     "homer": {
       "enabled": true,
-      "telegram_bot_token": "YOUR_HOMER_BOT_TOKEN",
+      "telegram_bot_token_file": "~/.claude-lab/homer/secrets/telegram-bot-token",
       "workspace": "~/.claude-lab/homer/.claude",
       "model": "opus",
       "timeout_sec": 300,
@@ -78,7 +80,7 @@ Edit `config.json` (example shows 3 agents -- use as many as you need):
     },
     "edith": {
       "enabled": true,
-      "telegram_bot_token": "YOUR_EDITH_BOT_TOKEN",
+      "telegram_bot_token_file": "~/.claude-lab/edith/secrets/telegram-bot-token",
       "workspace": "~/.claude-lab/edith/.claude",
       "model": "sonnet",
       "timeout_sec": 120,
@@ -87,6 +89,8 @@ Edit `config.json` (example shows 3 agents -- use as many as you need):
   }
 }
 ```
+
+> **Recommended:** Use `telegram_bot_token_file` instead of inline `telegram_bot_token` to keep secrets out of config.json. The file should contain the raw token string with no trailing newline.
 
 ### 4. Create Telegram Bot
 
@@ -159,6 +163,8 @@ chmod 600 /path/to/secrets/*
 | `streaming_mode` | string | "partial" | Live preview mode: `off` / `partial` / `progress` |
 | `agent_names` | string[] | [agent_key] | Name aliases for group-chat mention detection |
 | `topic_routing` | object | {} | Per-topic routing: `{"-100123": ["42", "99"]}` |
+| `env` | object | {} | Environment variables passed to Claude Code subprocess |
+| `openviking_account` | string | "default" | OpenViking account namespace |
 | `group_log_ov_user` | string | "" | OpenViking user for group chat logging (empty = disabled) |
 
 ### Environment variables (alternative to config)
@@ -173,12 +179,38 @@ export TELEGRAM_BOT_TOKEN=123456:ABC...
 
 | Command | Description |
 |---------|-------------|
-| `/status` | Show session info, memory sizes |
-| `/reset` | Save memory and start new session |
+| `/new` | Full handoff (save to handoff + decisions + memory) and new session |
+| `/status` | Session info, memory sizes, JSONL session stats |
+| `/reset` | Same as /new |
 | `/reset force` | Force-reset without saving |
 | `/stop` | Kill running Claude process |
-| `/compact` | Manually compact hot memory |
 | `/help` | Show command list |
+
+### Progress Display
+
+When `streaming_mode` is set to `progress`, the gateway shows a live status message during Claude Code execution:
+
+```
+working -- 45s
+
+<thinking snippet, 2 lines max>
+
+▸ editing files (8)
+
+▰▰▰▰▰▱▱▱▱▱ 50%
+  ... +2 done
+[x] M3: Current completed
+[>] M4: In progress
+[ ] M5: Next pending
+```
+
+Components of the progress display:
+
+- **Thinking:** last 2 lines of Claude's reasoning, max 140 characters total
+- **Activity:** single compact line showing current operation type and total count (not individual tool calls)
+- **Plan:** smart collapse -- progress bar on top, last completed task, in-progress task, next 2 pending tasks
+- **Subagent steps:** shown when Agent tool dispatches subagents (max 4 visible)
+- **Throttling:** activity updates every 5s, thinking/plan/subagents update immediately
 
 ## Webhook API
 
