@@ -390,6 +390,14 @@ curl -X POST "http://localhost:1933/api/v1/search/find" \
 - Group logs go to a **separate** OV namespace -- they don't pollute agent memories
 - Logging is fire-and-forget -- failures don't block the gateway
 
+## sendDocument
+
+Gateway automatically sends files written by Claude (via Write tool) as Telegram documents.
+
+Supported: `.html`, `.pdf`, `.png`, `.jpg`, `.csv`, `.svg`, `.pptx`, `.xlsx`, `.docx`, `.zip`, `.json`, `.txt`, `.py`, `.md`
+
+Security: files are only sent if they reside within the agent's workspace (path traversal prevention).
+
 ## Architecture
 
 ```

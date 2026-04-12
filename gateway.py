@@ -435,6 +435,8 @@ def _resolve_groq_key(cfg: dict) -> str | None:
 # Telegram API
 # ---------------------------------------------------------------------------
 
+_MAX_DOCUMENT_BYTES = 50 * 1024 * 1024  # Telegram sendDocument limit: 50 MB
+
 def tg_api(token: str, method: str, retry: int = 2, **params: Any) -> dict:
     """Telegram API call with retry on 429/5xx/network errors."""
     url = f"https://api.telegram.org/bot{token}/{method}"
@@ -617,6 +619,77 @@ def answer_callback_query(
         )
     except Exception as e:
         log.warning(f"answerCallbackQuery failed: {e}")
+
+
+def send_document(
+    token: str,
+    chat_id: int,
+    file_path: str,
+    caption: str | None = None,
+    reply_to: int | None = None,
+) -> dict:
+    """Send a local file to Telegram via sendDocument API.
+
+    Args:
+        token: Telegram bot token.
+        chat_id: Target chat ID.
+        file_path: Absolute path to local file.
+        caption: Optional caption (HTML, max 1024 chars).
+        reply_to: Optional message ID to reply to.
+
+    Returns:
+        Telegram API response dict.
+    """
+    url = f"https://api.telegram.org/bot{token}/sendDocument"
+    data: dict[str, Any] = {"chat_id": chat_id}
+    if caption:
+        data["caption"] = caption[:1024]
+        data["parse_mode"] = "HTML"
+    if reply_to:
+        data["reply_to_message_id"] = reply_to
+        data["allow_sending_without_reply"] = True
+    p = Path(file_path)
+    if not p.exists():
+        log.warning(f"send_document: file not found: {file_path}")
+        return {}
+    file_size = p.stat().st_size
+    if file_size > _MAX_DOCUMENT_BYTES:
+        log.warning(
+            f"send_document: file too large"
+            f" ({file_size} bytes): {file_path}"
+        )
+        return {}
+    last_exc: Any = None
+    for attempt in range(3):
+        try:
+            with open(p, "rb") as f:
+                files = {"document": (p.name, f)}
+                r = requests.post(
+                    url, data=data, files=files, timeout=120,
+                )
+            if r.status_code == 429:
+                wait = r.json().get(
+                    "parameters", {},
+                ).get("retry_after", 1)
+                time.sleep(min(wait, 30))
+                continue
+            if r.status_code >= 500:
+                last_exc = Exception(
+                    f"telegram {r.status_code}: {r.text[:200]}"
+                )
+                time.sleep(1 + attempt)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < 2:
+                time.sleep(1 + attempt)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    return {}
 
 
 # Pending callback handlers: {callback_data_prefix: handler_func}
@@ -1180,8 +1253,8 @@ def read_latest_memory_section(agent: str, cfg: dict) -> str:
 
 def invoke_claude(
     agent: str, cfg: dict, chat_id: int, user_text: str
-) -> tuple[str, int, int]:
-    """Run claude -p --resume <sid> and return (response_text, duration_ms, success)."""
+) -> tuple[str, int, int, list[str]]:
+    """Run claude -p --resume <sid> and return (response_text, duration_ms, success, written_files)."""
     sid = session_id_for(agent, chat_id)
     workspace = _get_workspace(agent, cfg)
     model = cfg.get("model", "sonnet")
@@ -1276,6 +1349,7 @@ def invoke_claude(
                     f"[gateway error: claude idle {int(idle)}s -- no activity]",
                     dur_ms,
                     0,
+                    [],
                 )
 
             # Refresh typing every 2s
@@ -1335,14 +1409,17 @@ def invoke_claude(
         if proc.returncode != 0:
             stderr = proc.stderr.read() if proc.stderr else ""
             log.error(f"claude exit {proc.returncode}: {stderr[:500]}")
-            return (f"[gateway error: claude exit {proc.returncode}]", dur_ms, 0)
+            return (f"[gateway error: claude exit {proc.returncode}]", dur_ms, 0, [])
         if is_first:
             sid_file.touch()
-        return (final_text.strip(), dur_ms, 1)
+        return (
+            final_text.strip(), dur_ms, 1,
+            tracker.written_files if tracker else [],
+        )
     except Exception as e:
         dur_ms = int((time.time() - t0) * 1000)
         log.exception(f"claude invoke failed: {e}")
-        return (f"[gateway error: {e}]", dur_ms, 0)
+        return (f"[gateway error: {e}]", dur_ms, 0, [])
     finally:
         _ACTIVE_PROCS.pop((agent, chat_id), None)
 
@@ -1576,6 +1653,14 @@ def _progress_bar(done: int, total: int, width: int = 10) -> str:
     return f"{bar} {pct}%"
 
 
+# File extensions that gateway can send as Telegram documents
+SENDABLE_EXTENSIONS = {
+    ".html", ".pdf", ".png", ".jpg", ".jpeg", ".csv", ".svg",
+    ".pptx", ".ppt", ".xlsx", ".xls", ".docx", ".doc",
+    ".zip", ".tar", ".gz", ".json", ".txt", ".py", ".md",
+}
+
+
 class _TaskBoundaryTracker:
     """Progress tracker: task boundaries + subagent dispatches.
     Clean display: thinking + plan + subagent steps.
@@ -1605,6 +1690,7 @@ class _TaskBoundaryTracker:
         self._thinking: str = ""  # last thinking block, truncated to 3-4 lines
         self._start_time: float = time.time()
         self._last_tool_render: float = 0.0
+        self.written_files: list[str] = []  # file paths from Write tool_use
 
     def _render(self) -> None:
         if not self.status_cb:
@@ -1745,6 +1831,13 @@ class _TaskBoundaryTracker:
                 # Keep last 10 tool calls
                 if len(self.tool_calls) > 10:
                     self.tool_calls = self.tool_calls[-10:]
+                # Track written files for sendDocument
+                if tname == "Write":
+                    fp = tinput.get("file_path", "")
+                    if fp:
+                        ext = Path(fp).suffix.lower()
+                        if ext in SENDABLE_EXTENSIONS:
+                            self.written_files.append(fp)
                 if tname == "TodoWrite":
                     self.todos = tinput.get("todos") or []
                     self._render()
@@ -2299,7 +2392,9 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
         "_typing_refresh_cb": lambda: send_chat_action(token, chat_id, "typing"),
         "_status_update_cb": status_update,
     }
-    response, dur_ms, status_int = invoke_claude(agent, invoke_cfg, chat_id, text_for_agent)
+    response, dur_ms, status_int, written_files = invoke_claude(
+        agent, invoke_cfg, chat_id, text_for_agent,
+    )
 
     # Delete status message before sending final reply (keep it clean)
     if status_msg_id[0]:
@@ -2331,6 +2426,35 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
             log.info(f"[{agent}] replied chat={chat_id} dur={dur_ms}ms")
         except Exception as e:
             log.exception(f"reply failed: {e}")
+
+    # Send written files as documents (sendDocument)
+    if written_files:
+        workspace = Path(expand(cfg["workspace"])).resolve()
+        for fpath in written_files:
+            try:
+                p = Path(fpath).resolve()
+                # Security: only send files within agent workspace
+                if not p.is_relative_to(workspace):
+                    log.warning(
+                        f"[{agent}] send_document blocked:"
+                        f" {fpath} outside workspace"
+                    )
+                    continue
+                if p.exists() and p.stat().st_size > 0:
+                    send_chat_action(token, chat_id, "upload_document")
+                    send_document(
+                        token, chat_id, fpath,
+                        caption=f"<code>{escape_html(p.name)}</code>",
+                    )
+                    log.info(
+                        f"[{agent}] sent document:"
+                        f" {p.name} chat={chat_id}"
+                    )
+            except Exception as e:
+                log.warning(
+                    f"[{agent}] send_document failed"
+                    f" for {fpath}: {e}"
+                )
 
 
 # ---------------------------------------------------------------------------
