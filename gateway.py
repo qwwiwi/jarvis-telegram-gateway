@@ -1309,7 +1309,8 @@ def invoke_claude(
     # In "off" mode, disable status updates (no edit-in-place preview)
     if streaming_mode == "off":
         status_cb = None
-    tracker = _TaskBoundaryTracker(status_cb) if status_cb else None
+    # Always create tracker for file tracking (sendDocument), even without status display
+    tracker = _TaskBoundaryTracker(status_cb)
     t0 = time.time()
     last_activity = t0  # heartbeat: reset on every event from Claude
     last_typing = 0.0
@@ -2432,7 +2433,9 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
         workspace = Path(expand(cfg["workspace"])).resolve()
         for fpath in written_files:
             try:
-                p = Path(fpath).resolve()
+                # Resolve relative paths against agent workspace, not gateway CWD
+                raw = Path(fpath)
+                p = (workspace / raw).resolve() if not raw.is_absolute() else raw.resolve()
                 # Security: only send files within agent workspace
                 if not p.is_relative_to(workspace):
                     log.warning(
@@ -2443,7 +2446,7 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
                 if p.exists() and p.stat().st_size > 0:
                     send_chat_action(token, chat_id, "upload_document")
                     send_document(
-                        token, chat_id, fpath,
+                        token, chat_id, str(p),
                         caption=f"<code>{escape_html(p.name)}</code>",
                     )
                     log.info(
