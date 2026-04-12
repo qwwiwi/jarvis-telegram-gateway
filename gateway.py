@@ -99,7 +99,7 @@ _MSG_QUEUES: dict[str, queue.Queue] = {}
 _SHUTDOWN_EVENT = threading.Event()
 
 # Out-of-band commands handled instantly by producer thread
-_OOB_COMMANDS = frozenset({"/stop", "/cancel", "/status", "/reset"})
+_OOB_COMMANDS = frozenset({"/stop", "/cancel", "/status", "/reset", "/new"})
 
 
 @_atexit.register
@@ -923,22 +923,31 @@ def handle_command(token: str, chat_id: int, agent: str, cmd: str, args: str, cf
         if sid_file.exists():
             sid = sid_file.read_text().strip()
             age = time.time() - sid_file.stat().st_mtime
-            age_str = f"{int(age/3600)}h {int((age%3600)/60)}m" if age > 3600 else f"{int(age/60)}m"
+            age_str = f"{int(age/3600)}ч {int((age%3600)/60)}м" if age > 3600 else f"{int(age/60)}м"
+            session_extra = ""
+            jsonl_dir = Path.home() / ".claude" / "projects"
+            for d in jsonl_dir.iterdir() if jsonl_dir.exists() else []:
+                jf = d / f"{sid}.jsonl"
+                if jf.exists():
+                    size_kb = jf.stat().st_size / 1024
+                    turns = sum(1 for _ in jf.open())
+                    session_extra = f"\nturns: {turns} | {size_kb:.0f} KB"
+                    break
             text = (
-                f"<b>session active</b>\n"
+                f"<b>сессия активна</b>\n"
                 f"id: <code>{sid[:8]}...</code>\n"
-                f"age: {age_str}\n\n"
-                f"<b>memory</b>\n"
-                f"rules (permanent): {rules_kb:.1f} KB\n"
-                f"warm (decisions 14d): {decisions_kb:.1f} KB\n"
-                f"hot (recent 24h): {hot_kb:.1f} KB\n"
-                f"cold (MEMORY.md): {memory_kb:.1f} KB"
+                f"возраст: {age_str}{session_extra}\n\n"
+                f"<b>память</b>\n"
+                f"rules: {rules_kb:.1f} KB\n"
+                f"warm (decisions): {decisions_kb:.1f} KB\n"
+                f"hot (recent): {hot_kb:.1f} KB\n"
+                f"cold (MEMORY): {memory_kb:.1f} KB"
             )
         else:
             text = (
-                f"<b>no active session</b>\n\n"
-                f"next message creates a new one\n\n"
-                f"<b>memory</b>\n"
+                f"<b>сессия пуста</b>\n\n"
+                f"следующее сообщение = новая сессия\n\n"
+                f"<b>память</b>\n"
                 f"rules: {rules_kb:.1f} KB\n"
                 f"warm: {decisions_kb:.1f} KB\n"
                 f"hot: {hot_kb:.1f} KB\n"
@@ -975,19 +984,28 @@ def handle_command(token: str, chat_id: int, agent: str, cmd: str, args: str, cf
                 pass
             return True
 
-        # Async reset: notify, then run save in background, then complete reset
         try:
             ack = tg_api(token, "sendMessage", chat_id=chat_id,
-                         text="<i>saving context to MEMORY.md...</i>", parse_mode="HTML")
+                         text="<i>handoff: сжимаю контекст...</i>", parse_mode="HTML")
             ack_msg_id = ack.get("result", {}).get("message_id")
         except Exception:
             ack_msg_id = None
 
-        def _do_reset_save():
-            save_prompt = (
-                "SYSTEM: user requested reset. Before reset update core/MEMORY.md -- "
-                "add the most important from current context (current focus, decisions, "
-                "pending actions, user preferences). Use Edit tool. Reply briefly: what was saved."
+        def _do_handoff_reset():
+            handoff_prompt = (
+                "СИСТЕМА: принц нажал /new — полный handoff перед сбросом сессии.\n"
+                "Выполни ВСЕ 3 шага:\n\n"
+                "1. HANDOFF: Прочитай core/hot/handoff.md (Read tool). "
+                "Перезапиши его (Write tool) — оставь последние 10 записей из текущей сессии "
+                "(что делали, что решили, что pending). Формат: '### YYYY-MM-DD HH:MM [тип]\\n**Принц:** ...\\n**Silvana:** ...'\n\n"
+                "2. WARM: Прочитай core/warm/decisions.md (Read tool). "
+                "Добавь в НАЧАЛО файла новую секцию с сегодняшней датой — "
+                "ключевые решения, архитектурные изменения, новые правила из этой сессии. "
+                "Не дублируй то что уже есть. Edit tool.\n\n"
+                "3. MEMORY: Прочитай MEMORY.md (через auto-memory путь). "
+                "Добавь/обнови записи: текущий focus, pending actions, "
+                "важные решения которых нет в decisions.md. Edit tool.\n\n"
+                "Ответь одной строкой: 'handoff: N в handoff, M в decisions, K в memory'"
             )
             import subprocess as _sp
             workspace = _get_workspace(agent, cfg)
@@ -995,26 +1013,24 @@ def handle_command(token: str, chat_id: int, agent: str, cmd: str, args: str, cf
             env["PATH"] = f"{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
             for k, v in (cfg.get("env") or {}).items():
                 env[k] = v
-            summary = "(not received)"
+            summary = "(не получен)"
             try:
                 r = _sp.run(
-                    ["claude", "-p", save_prompt, "--model", "sonnet",
+                    ["claude", "-p", handoff_prompt, "--model", "sonnet",
                      "--output-format", "text", "--permission-mode", "bypassPermissions",
                      "--resume", old_sid],
-                    cwd=workspace, env=env, capture_output=True, text=True, timeout=90,
+                    cwd=workspace, env=env, capture_output=True, text=True, timeout=120,
                 )
-                summary = (r.stdout or r.stderr or "").strip()[:300]
+                summary = (r.stdout or r.stderr or "").strip()[:400]
             except Exception as e:
-                summary = f"(save error: {e})"
-            # Delete session files AFTER save
+                summary = f"(ошибка handoff: {e})"
             sid_file.unlink(missing_ok=True)
             first_file.unlink(missing_ok=True)
-            # Notify user
             final_text = (
-                f"<b>session reset</b>\n\n"
-                f"old: <code>{old_sid[:8]}...</code>\n"
-                f"saved: <i>{escape_html(summary)}</i>\n\n"
-                f"next message = new session"
+                f"<b>новая сессия</b>\n\n"
+                f"старая: <code>{old_sid[:8]}...</code>\n"
+                f"{escape_html(summary)}\n\n"
+                f"следующее сообщение = свежий контекст"
             )
             if ack_msg_id:
                 edit_message(token, chat_id, ack_msg_id, final_text)
@@ -1025,7 +1041,7 @@ def handle_command(token: str, chat_id: int, agent: str, cmd: str, args: str, cf
                     pass
 
         import threading as _th
-        _th.Thread(target=_do_reset_save, daemon=True).start()
+        _th.Thread(target=_do_handoff_reset, daemon=True).start()
         return True
 
     if cmd == "/compact":
@@ -1552,31 +1568,33 @@ def _handle_stream_event(event: dict, tracker: Any) -> None:
 
 
 def _progress_bar(done: int, total: int, width: int = 10) -> str:
-    """Render ASCII progress bar: [------->>>] 70%"""
     if total <= 0:
         return ""
     pct = min(100, int(done * 100 / total))
     filled = int(width * done / total)
-    bar = "#" * filled + "." * (width - filled)
-    return f"[{bar}] {pct}%"
+    bar = "\u25b0" * filled + "\u25b1" * (width - filled)
+    return f"{bar} {pct}%"
 
 
 class _TaskBoundaryTracker:
     """Progress tracker: task boundaries + subagent dispatches.
-    NO emoji -- uses ASCII brackets + box-drawing only.
+    Clean display: thinking + plan + subagent steps.
+    Individual tool calls (Read/Edit/Bash) collapsed to single activity line.
 
     Format:
+      working -- 45s
+      <thinking snippet>
+
       plan:
-      [ ] pending task
-      [>] in-progress task
       [x] completed task
+      [>] in-progress task
+      [ ] pending task
+      ▰▰▰▰▰▱▱▱▱▱ 50%
 
       steps:
-       1 | researcher
+       1 | researcher -- done
        2 | content-writer  <- now
        3 | delivery
-
-      progress [######....] 70%
     """
     def __init__(self, status_cb):
         self.status_cb = status_cb
@@ -1584,18 +1602,20 @@ class _TaskBoundaryTracker:
         self.dispatches: list[dict] = []  # [{label, desc, status, summary}]
         self.pending_agents: dict[str, int] = {}  # tool_use_id -> dispatch index
         self.tool_calls: list[dict] = []  # [{tag, name, detail}] last N tool calls
+        self._thinking: str = ""  # last thinking block, truncated to 3-4 lines
         self._start_time: float = time.time()
+        self._last_tool_render: float = 0.0
 
     def _render(self) -> None:
         if not self.status_cb:
             return
         parts = []
-        # Elapsed time header
         elapsed = int(time.time() - self._start_time)
         parts.append(f"<code>working -- {elapsed}s</code>")
-        # Recent tool calls
+        if self._thinking:
+            parts.append(f"<i>{escape_html(self._thinking)}</i>")
         if self.tool_calls:
-            parts.append(self._render_tools())
+            parts.append(self._render_activity())
         if self.todos:
             parts.append(self._render_todos())
         if self.dispatches:
@@ -1604,49 +1624,71 @@ class _TaskBoundaryTracker:
         if text:
             self.status_cb(text)
 
-    def _render_tools(self) -> str:
-        """Render last 10 tool calls in ASCII format -- no dedup, full stream."""
-        lines = []
-        for tc in self.tool_calls[-10:]:
-            tag = escape_html(tc["tag"])
-            detail = tc.get("detail", "")
-            if detail:
-                lines.append(f"<code>{tag}</code> {_mask_secrets(escape_html(detail))}")
-            else:
-                lines.append(f"<code>{tag}</code> {escape_html(tc['name'].lower())}")
-        return "\n".join(lines)
+    def _render_activity(self) -> str:
+        """Single compact activity line instead of listing every tool call."""
+        if not self.tool_calls:
+            return ""
+        last = self.tool_calls[-1]
+        name = last["name"]
+        total = len(self.tool_calls)
+        ACTIVITY_LABELS = {
+            "Read": "reading files",
+            "Write": "writing files",
+            "Edit": "editing files",
+            "MultiEdit": "editing files",
+            "Bash": "running commands",
+            "Grep": "searching code",
+            "Glob": "searching files",
+            "WebFetch": "fetching web",
+            "WebSearch": "web search",
+            "ToolSearch": "loading tools",
+            "Skill": "running skill",
+            "NotebookEdit": "editing notebook",
+        }
+        label = ACTIVITY_LABELS.get(name, name.lower())
+        return f"<code>▸</code> {label} ({total})"
 
     def _render_todos(self) -> str:
-        lines = ["<b>plan:</b>"]
         done = sum(1 for t in self.todos if t.get("status") == "completed")
         total = len(self.todos)
-        for t in self.todos[:10]:
-            status = t.get("status", "pending")
-            content = escape_html((t.get("content") or "")[:80])
-            mark = {"completed": "[x]", "in_progress": "[&gt;]", "pending": "[ ]"}.get(status, "[ ]")
-            if status == "completed":
-                lines.append(f"<code>{mark}</code> <s>{content}</s>")
-            elif status == "in_progress":
-                lines.append(f"<code>{mark}</code> <b>{content}</b>")
+        completed = [t for t in self.todos if t.get("status") == "completed"]
+        in_progress = [t for t in self.todos if t.get("status") == "in_progress"]
+        pending = [t for t in self.todos if t.get("status") == "pending"]
+        visible: list[tuple[dict, str]] = []
+        if completed:
+            visible.append((completed[-1], "completed"))
+        if done > 1:
+            visible.insert(0, ({"content": f"... +{done - 1} done"}, "skip"))
+        for t in in_progress:
+            visible.append((t, "in_progress"))
+        for t in pending[:2]:
+            visible.append((t, "pending"))
+        if len(pending) > 2:
+            visible.append(({"content": f"... +{len(pending) - 2} more"}, "skip"))
+        lines = [f"<code>{_progress_bar(done, total)}</code>"]
+        for t, st in visible:
+            content = escape_html((t.get("content") or "")[:60])
+            if st == "skip":
+                lines.append(f"  {content}")
+            elif st == "completed":
+                lines.append(f"<code>[x]</code> <s>{content}</s>")
+            elif st == "in_progress":
+                lines.append(f"<code>[&gt;]</code> <b>{content}</b>")
             else:
-                lines.append(f"<code>{mark}</code> {content}")
-        if len(self.todos) > 10:
-            lines.append(f"  ... +{len(self.todos) - 10} more")
-        if total > 0:
-            lines.append(f"\n<code>{_progress_bar(done, total)}</code>")
+                lines.append(f"<code>[ ]</code> {content}")
         return "\n".join(lines)
 
     def _render_dispatches(self) -> str:
         total = len(self.dispatches)
         single = total == 1
         lines = [] if single else ["<b>steps:</b>"]
-        for i, d in enumerate(self.dispatches[-8:], start=max(1, total - 7)):
+        for i, d in enumerate(self.dispatches[-4:], start=max(1, total - 3)):
             label = escape_html(d["label"])
             status = d["status"]
             if single:
                 # Single dispatch -- no number, just label with status
                 if status == "done":
-                    summary = escape_html(d.get("summary", "")[:60])
+                    summary = escape_html(d.get("summary", "")[:30])
                     marker = f" -- {summary}" if summary else ""
                     lines.append(f"<s>{label}</s>{marker}")
                 elif status == "running":
@@ -1655,7 +1697,7 @@ class _TaskBoundaryTracker:
                     lines.append(f"<b>{label}</b>{desc_part}")
             else:
                 if status == "done":
-                    summary = escape_html(d.get("summary", "")[:60])
+                    summary = escape_html(d.get("summary", "")[:30])
                     marker = "" if not summary else f" -- <i>{summary}</i>"
                     lines.append(f" {i:>2} | <s>{label}</s>{marker}")
                 elif status == "running":
@@ -1669,11 +1711,25 @@ class _TaskBoundaryTracker:
             lines.append(f"\n<code>{_progress_bar(done, total)}</code>")
         return "\n".join(lines)
 
+    @staticmethod
+    def _truncate_thinking(text: str, max_lines: int = 2, max_chars: int = 140) -> str:
+        lines = [ln.strip() for ln in text.strip().split("\n") if ln.strip()]
+        result = "\n".join(lines[-max_lines:])
+        if len(result) > max_chars:
+            result = result[:max_chars].rsplit(" ", 1)[0] + "..."
+        return result
+
     def handle_event(self, event: dict) -> None:
         etype = event.get("type")
         if etype == "assistant":
             content = (event.get("message") or {}).get("content") or []
             for block in content:
+                if block.get("type") == "thinking":
+                    raw = block.get("thinking") or ""
+                    if raw.strip():
+                        self._thinking = self._truncate_thinking(raw)
+                        self._render()
+                    continue
                 if block.get("type") != "tool_use":
                     continue
                 tname = block.get("name", "")
@@ -1701,8 +1757,10 @@ class _TaskBoundaryTracker:
                     self.pending_agents[tuid] = idx
                     self._render()
                 else:
-                    # Re-render for any tool call (not just TodoWrite/Agent)
-                    self._render()
+                    now = time.time()
+                    if now - self._last_tool_render >= 5.0:
+                        self._last_tool_render = now
+                        self._render()
         elif etype == "user":
             # tool_result for Agent = subagent finished
             content = (event.get("message") or {}).get("content") or []
@@ -2278,12 +2336,12 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
 # ---------------------------------------------------------------------------
 
 _BOT_COMMANDS = [
-    {"command": "stop", "description": "Stop current agent task"},
-    {"command": "status", "description": "Session and memory status"},
-    {"command": "reset", "description": "Reset session (saves important to MEMORY)"},
-    {"command": "reset_force", "description": "Reset without saving"},
-    {"command": "compact", "description": "Manual memory compaction"},
-    {"command": "help", "description": "Help"},
+    {"command": "new", "description": "Новая сессия (полный handoff)"},
+    {"command": "status", "description": "Статус сессии и памяти"},
+    {"command": "stop", "description": "Остановить текущую задачу"},
+    {"command": "compact", "description": "Компактизация памяти"},
+    {"command": "reset", "description": "Сброс без handoff (force)"},
+    {"command": "help", "description": "Справка по командам"},
 ]
 
 
@@ -2304,7 +2362,8 @@ def _is_oob_command(text: str) -> bool:
 
 
 def _handle_oob_command(
-    agent: str, token: str, chat_id: int, text: str
+    agent: str, token: str, chat_id: int, text: str,
+    cfg: dict | None = None,
 ) -> None:
     """Handle out-of-band command immediately from producer thread.
 
@@ -2348,8 +2407,7 @@ def _handle_oob_command(
         return
 
     if cmd == "/status":
-        # Reuse existing handle_command for /status (it's fast, no blocking)
-        handle_command(token, chat_id, agent, "/status", "")
+        handle_command(token, chat_id, agent, "/status", "", cfg=cfg or {})
         log.info(f"[{agent}] OOB /status chat={chat_id}")
         return
 
@@ -2513,13 +2571,13 @@ def polling_producer(
                     cmd = cmd.split("@")[0]
                 args = parts[1].lower() if len(parts) > 1 else ""
 
-                if cmd == "/reset" and args != "force":
-                    # Non-force reset -> queue for consumer
+                if cmd == "/new" or (cmd == "/reset" and args != "force"):
+                    # /new and non-force /reset -> queue for consumer (blocking handoff)
                     msg_queue.put(upd)
                     continue
 
                 try:
-                    _handle_oob_command(agent, token, chat_id, text)
+                    _handle_oob_command(agent, token, chat_id, text, cfg=cfg)
                 except Exception:
                     log.exception(
                         f"[{agent}] OOB command failed: {text}"
