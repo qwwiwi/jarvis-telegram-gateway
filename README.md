@@ -149,7 +149,7 @@ chmod 600 /path/to/secrets/*
 | `telegram_bot_token` | string | required | Telegram Bot API token |
 | `telegram_bot_token_file` | string | -- | Alternative: read token from file |
 | `workspace` | string | required | Path to agent's `.claude` directory |
-| `model` | string | "sonnet" | Claude model alias |
+| `model` | string | "sonnet" | Claude model alias (e.g., `"opus"`, `"sonnet"`). Opus for coordinators/coders, Sonnet for mass operations |
 | `timeout_sec` | int | 120 | Idle timeout before killing subprocess |
 | `system_reminder` | string | "" | System prompt injected into each turn (fallback for private) |
 | `system_reminder_private` | string | `system_reminder` | System prompt for private (DM) chats |
@@ -175,6 +175,24 @@ export GROQ_API_KEY=YOUR_GROQ_API_KEY
 export TELEGRAM_BOT_TOKEN=123456:ABC...
 ```
 
+### CLAUDE_CODE_AUTO_COMPACT_WINDOW
+
+The gateway sets `CLAUDE_CODE_AUTO_COMPACT_WINDOW=400000` by default for all agent subprocesses via `env.setdefault()`. This compacts context at 400K tokens instead of the default 800K, improving thinking depth for long sessions.
+
+Agents can override this value via their `env` config block:
+
+```json
+{
+  "agents": {
+    "jarvis": {
+      "env": {
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "600000"
+      }
+    }
+  }
+}
+```
+
 ## Commands
 
 | Command | Description |
@@ -184,6 +202,7 @@ export TELEGRAM_BOT_TOKEN=123456:ABC...
 | `/reset` | Same as /new |
 | `/reset force` | Force-reset without saving |
 | `/stop` | Kill running Claude process |
+| `/compact` | Manual hot→warm memory compaction |
 | `/help` | Show command list |
 
 ### Progress Display

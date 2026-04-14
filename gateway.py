@@ -1261,6 +1261,7 @@ def invoke_claude(
 
     env = os.environ.copy()
     env["PATH"] = f"{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    env.setdefault("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "400000")
     for k, v in cfg.get("env", {}).items():
         env[k] = v
 
@@ -1326,6 +1327,10 @@ def invoke_claude(
             text=True,
             bufsize=1,  # line-buffered
         )
+        # Mark session as registered immediately after Popen —
+        # CLI already owns the session-id at this point
+        if is_first:
+            sid_file.touch()
         # Register for /stop command
         _ACTIVE_PROCS[(agent, chat_id)] = proc
 
@@ -1410,9 +1415,10 @@ def invoke_claude(
         if proc.returncode != 0:
             stderr = proc.stderr.read() if proc.stderr else ""
             log.error(f"claude exit {proc.returncode}: {stderr[:500]}")
+            if "already in use" in stderr:
+                sid_file.touch()
+                log.warning(f"auto-recovery: touched {sid_file.name} after 'already in use'")
             return (f"[gateway error: claude exit {proc.returncode}]", dur_ms, 0, [])
-        if is_first:
-            sid_file.touch()
         return (
             final_text.strip(), dur_ms, 1,
             tracker.written_files if tracker else [],
