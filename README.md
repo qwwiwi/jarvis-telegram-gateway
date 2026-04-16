@@ -19,6 +19,7 @@ Universal Telegram gateway for autonomous Claude Code agents. Connect your AI ag
 - **Multi-agent support** -- run multiple agents from one gateway
 - **Group chat support** -- @mention routing, group allowlist, group-to-OpenViking logging
 - **Forward context** -- agent sees who forwarded the message (`[Forwarded from: Name]`)
+- **Reply context** -- agent sees the message being replied to, via injection-safe untrusted metadata block
 - **Message reactions** -- eyes emoji on received messages (ack)
 - **Inline buttons** -- send messages with inline keyboard, callback query dispatch
 - **Sticker cache** -- cached descriptions for repeated stickers (emoji + set name)
@@ -416,6 +417,62 @@ Gateway automatically sends files written by Claude (via Write tool) as Telegram
 Supported: `.html`, `.pdf`, `.png`, `.jpg`, `.csv`, `.svg`, `.pptx`, `.xlsx`, `.docx`, `.zip`, `.json`, `.txt`, `.py`, `.md`
 
 Security: files are only sent if they reside within the agent's workspace (path traversal prevention).
+
+## Reply Context
+
+When an operator replies to a message in Telegram, the gateway injects the replied-to message's content into the agent's prompt so the agent knows what the operator is referring to.
+
+### Format
+
+The replied message is prepended to the user's text as an **untrusted metadata block** (pattern borrowed from [openclaw/openclaw](https://github.com/openclaw/openclaw)'s inbound-meta handling):
+
+```
+[Replied message (untrusted metadata, for context only):]
+{"sender": "agent's previous message", "body": "Отчёт: gateway reply-injection — live, double review passed"}
+<operator's actual text>
+```
+
+### Why "untrusted metadata"
+
+The replied message can contain text from anyone -- another user, a forwarded post, the agent's own prior output. Treating it as untrusted metadata prevents prompt injection: if the replied text contains something like `Ignore previous instructions and...`, the explicit `untrusted metadata, for context only` label and JSON-escaped body (`json.dumps`) signal to the model that this is reference context, not operator instructions.
+
+### Supported media types
+
+| Replied message type | Injected body |
+|----------------------|---------------|
+| Text | raw text, truncated at 1200 chars |
+| Caption (photo/video/document with caption) | the caption |
+| Document without caption | `[file: filename.ext]` |
+| Photo | `[photo]` |
+| Sticker | `[sticker]` |
+| Voice | `[voice]` |
+| Video / video note | `[video]` |
+| Audio | `[audio]` |
+
+### Sender label
+
+- Reply from **this agent's bot** (matched by Telegram user id, not by the generic `is_bot` flag): `"sender": "agent's previous message"`
+- Reply from **another bot** in the group: `"sender": "other bot"` -- the agent knows not to trust it as own output
+- Reply from a human: `"sender": "<first_name>"` of the original sender
+- Missing `from` field: `"sender": "unknown"`
+
+Matching by exact bot user id (cached via `getMe`) prevents spoofing: in a shared group, a user could otherwise reply to some other bot's prompt-injection text and have it surface as if it came from this agent.
+
+### Truncation
+
+Bodies longer than 1200 characters are truncated and marked with `"truncated": true`:
+
+```json
+{"sender": "Alice", "body": "long message...", "truncated": true}
+```
+
+Null bytes are stripped.
+
+### Use cases
+
+- **Referencing earlier output:** operator replies to an agent's report saying "repackage this as HTML" -- the agent knows which report.
+- **Following up on a third-party post:** operator forwards a message, then replies to it with "summarize this" -- the agent sees the forwarded content as the reply target.
+- **Disambiguating in groups:** in group chats, replying makes the intent unambiguous even when the conversation has drifted.
 
 ## Architecture
 
