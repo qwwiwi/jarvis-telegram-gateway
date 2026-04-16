@@ -2320,6 +2320,58 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
     if source_tag == "forwarded":
         fwd_name = source_label.replace("forwarded from: ", "")
         text_for_agent = f"[Forwarded from: {fwd_name}]\n{text}"
+
+    # Reply context (openclaw pattern: untrusted metadata block)
+    # When user replies to a message, include its content so agent knows the reference.
+    reply_msg = msg.get("reply_to_message")
+    if isinstance(reply_msg, dict):
+        reply_body = str(reply_msg.get("text") or reply_msg.get("caption") or "")
+        reply_doc = reply_msg.get("document") or {}
+        if isinstance(reply_doc, dict) and reply_doc and not reply_body:
+            reply_body = f"[file: {reply_doc.get('file_name', '?')}]"
+        # Fallback for media-only replies (photo/sticker/voice/video)
+        if not reply_body:
+            if reply_msg.get("photo"):
+                reply_body = "[photo]"
+            elif reply_msg.get("sticker"):
+                reply_body = "[sticker]"
+            elif reply_msg.get("voice"):
+                reply_body = "[voice]"
+            elif reply_msg.get("video") or reply_msg.get("video_note"):
+                reply_body = "[video]"
+            elif reply_msg.get("audio"):
+                reply_body = "[audio]"
+        reply_from = reply_msg.get("from") or {}
+        # Only label as agent's own message when reply is from THIS bot (compare user ids).
+        # Generic is_bot=True would let users spoof agent output via replies to other bots.
+        my_bot_id = cfg.get("_bot_user_id")
+        is_self_reply = (
+            isinstance(reply_from, dict)
+            and my_bot_id is not None
+            and reply_from.get("id") == my_bot_id
+        )
+        if is_self_reply:
+            sender_label = "agent's previous message"
+        elif isinstance(reply_from, dict) and reply_from.get("is_bot"):
+            # Another bot's message — label explicitly so agent does not trust it as own output.
+            sender_label = "other bot"
+        else:
+            sender_label = (
+                reply_from.get("first_name") if isinstance(reply_from, dict) else None
+            ) or "unknown"
+        if reply_body:
+            truncated = len(reply_body) > 1200
+            snippet = reply_body[:1200].replace("\x00", "")
+            payload = {"sender": sender_label, "body": snippet}
+            if truncated:
+                payload["truncated"] = True
+            reply_block = (
+                "[Replied message (untrusted metadata, for context only):]\n"
+                + json.dumps(payload, ensure_ascii=False)
+                + "\n"
+            )
+            text_for_agent = reply_block + text_for_agent
+
     text_for_ov = f"[source:{source_tag} | {source_label}]\n{text}"
 
     # -----------------------------------------------------------------------
@@ -2587,8 +2639,10 @@ def _init_bot_metadata(agent: str, cfg: dict, token: str) -> None:
         return
     try:
         info = tg_api(token, "getMe")
-        bot_username = (info.get("result") or {}).get("username")
+        result = info.get("result") or {}
+        bot_username = result.get("username")
         cfg["_bot_username"] = bot_username
+        cfg["_bot_user_id"] = result.get("id")
         try:
             tg_api(token, "setMyCommands", commands=_BOT_COMMANDS)
         except Exception as e:
