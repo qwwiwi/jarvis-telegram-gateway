@@ -70,6 +70,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -86,8 +87,10 @@ import atexit as _atexit
 # Globals
 # ---------------------------------------------------------------------------
 
-# Bounded thread pool for OV pushes (prevents unbounded thread spawning on message bursts)
-_OV_POOL = _ThreadPoolExecutor(max_workers=2, thread_name_prefix="ov-push")
+# Bounded thread pool for L4 (OV + Cognee) pushes — prevents unbounded thread
+# spawning on message bursts. Renamed from _OV_POOL in T-19 when the gateway
+# started routing semantic-memory writes through silvana_cognee.dual_write.
+_L4_POOL = _ThreadPoolExecutor(max_workers=2, thread_name_prefix="l4-push")
 
 # Active claude subprocesses per (agent, chat_id) for /stop command
 _ACTIVE_PROCS: dict[tuple[str, int], Any] = {}
@@ -103,12 +106,342 @@ _OOB_COMMANDS = frozenset({"/stop", "/cancel", "/status", "/reset", "/new"})
 
 
 @_atexit.register
-def _shutdown_ov_pool() -> None:
-    """Graceful drain of pending OV pushes on gateway shutdown."""
+def _shutdown_l4_pool() -> None:
+    """Graceful drain of pending L4 pushes on gateway shutdown."""
     try:
-        _OV_POOL.shutdown(wait=True, cancel_futures=False)
+        _L4_POOL.shutdown(wait=True, cancel_futures=False)
     except Exception:
         pass
+
+
+# --- L4 bridge to silvana_cognee (subprocess to cognee venv) ---------------
+# Gateway runs under system Python; silvana_cognee is installed into the
+# dedicated cognee venv (has cognee==1.0.0 + its LanceDB/Kuzu wheels).
+# We shell out instead of importing to keep gateway's dep footprint intact
+# and to keep a single rollback surface (delete this block + rename pool).
+_L4_VENV_PY = Path("/Users/jasonqwwen/cognee-silvana/venv/bin/python")
+_L4_CLI_ENABLED = _L4_VENV_PY.exists()
+
+# M3: shared-Thrall HTTP transport. When an agent opts into ``l4_transport =
+# "http"`` the gateway skips the local cognee venv entirely and POSTs the
+# gateway event straight to the shared Cognee FastAPI on Thrall. Agents
+# running on hosts without a local venv (Kaelthas, Arthas, Illidan) rely on
+# this path; agents with a venv can keep ``subprocess`` (default) during the
+# M5 backfill + M6 cutover window for safe rollback.
+_L4_HTTP_TIMEOUT_S = 30.0
+_L4_HTTP_COGNIFY_TIMEOUT_S = 90.0
+# Max per-message body size before we truncate. Matches
+# ``silvana_cognee.sanitize.clamp_len`` default so HTTP and subprocess
+# produce byte-identical ingests for the same input.
+_L4_HTTP_CLAMP_CHARS = 3000
+# Byte-for-byte parity with silvana_cognee.sanitize.TRUNCATION_MARKER. No
+# leading newline, no space before [truncated]. If Python tightens this,
+# tests/test_gateway_l4_http.py::test_clamp_over_limit_adds_marker will
+# catch the drift before a cutover makes it user-visible.
+_L4_HTTP_TRUNCATION_MARKER = "\u2026[truncated]"
+# Parity with ``silvana_cognee.dual_write._PUSH_WHITELIST`` — categories we
+# willingly push to the graph. ``external_media`` deliberately absent (agents
+# forward third-party content we don't want extracted as user preference).
+# Must stay in lockstep; drift is caught by tests/test_gateway_l4_http.py.
+_L4_HTTP_PUSH_WHITELIST = frozenset({
+    "own_text", "own_voice", "forwarded", "group_mention",
+})
+# Cached api-key reads keyed by (path, mtime_ns) so we do not re-read the
+# key file on every Telegram message. Gateway runs single-threaded per chat,
+# but _L4_POOL workers share this dict — protected by a Lock.
+_L4_HTTP_KEY_CACHE: dict[tuple[str, int], str] = {}
+_L4_HTTP_KEY_LOCK = threading.Lock()
+
+
+def _l4_http_scrub(text: str) -> str:
+    """Mirror ``silvana_cognee.sanitize.scrub_nulls`` — strip U+0000 only."""
+    if not isinstance(text, str):
+        return ""
+    return text.replace("\x00", "")
+
+
+def _l4_http_clamp(text: str) -> str:
+    """Mirror ``silvana_cognee.sanitize.clamp_len`` with the default 3000 cap
+    and the same trailing marker shape. Symmetric with subprocess output so
+    operators can diff ingests across transports during the cutover window.
+    """
+    if len(text) <= _L4_HTTP_CLAMP_CHARS:
+        return text
+    return text[:_L4_HTTP_CLAMP_CHARS] + _L4_HTTP_TRUNCATION_MARKER
+
+
+def _l4_http_read_key(key_path: Path) -> str | None:
+    """Read the Cognee API key file with an mtime-keyed cache.
+
+    Returns ``None`` if the file is missing, unreadable, or empty — the caller
+    logs and skips. We key on ``(absolute path, mtime_ns)`` so a key rotation
+    (file rewrite bumps mtime) naturally invalidates the cached value without
+    a restart.
+    """
+    try:
+        st = key_path.stat()
+    except OSError as exc:
+        log.warning("[l4-http] api key stat failed for %s: %s", key_path, exc)
+        return None
+    cache_key = (str(key_path.resolve()), st.st_mtime_ns)
+    with _L4_HTTP_KEY_LOCK:
+        cached = _L4_HTTP_KEY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        value = key_path.read_text().strip()
+    except OSError as exc:
+        log.warning("[l4-http] api key read failed for %s: %s", key_path, exc)
+        return None
+    if not value:
+        log.warning("[l4-http] api key file is empty: %s", key_path)
+        return None
+    with _L4_HTTP_KEY_LOCK:
+        _L4_HTTP_KEY_CACHE[cache_key] = value
+    return value
+
+
+def _l4_transport(cfg: dict) -> str:
+    """Return ``"http"`` or ``"subprocess"`` based on agent cfg + env.
+
+    Resolution order:
+      1. ``cfg.l4_transport`` (per-agent explicit choice).
+      2. ``L4_TRANSPORT`` env var (operator override for kicking the tyres).
+      3. ``"subprocess"`` (safe default — matches pre-M3 behaviour).
+    """
+    raw = cfg.get("l4_transport")
+    if not isinstance(raw, str) or not raw:
+        raw = os.environ.get("L4_TRANSPORT", "subprocess")
+    value = raw.strip().lower()
+    return "http" if value == "http" else "subprocess"
+
+
+def _l4_http_ready(cfg: dict) -> bool:
+    """Cheap pre-flight check so we never attempt a partial HTTP push."""
+    required = ("cognee_remote_url", "cognee_remote_api_key_file",
+                "cognee_agent_slug")
+    return all(isinstance(cfg.get(k), str) and cfg[k] for k in required)
+
+
+def _l4_qualify_dataset(slug: str, prefix: str, name: str) -> str:
+    """Mirror ``silvana_cognee.remote.qualify_dataset`` so the gateway writes
+    into the same namespace the Python client does. Idempotent on re-apply.
+    """
+    marker = f"{slug}__"
+    base = name or "default"
+    while base.startswith(marker):
+        base = base[len(marker):]
+    if prefix and not base.startswith(prefix):
+        base = f"{prefix}{base}"
+    return f"{slug}__{base}"
+
+
+def _l4_http_call(subcmd: str, cfg: dict, agent: str, chat_id: int,
+                  payload: dict, extra: dict | None = None) -> None:
+    """Direct POST to Cognee FastAPI /api/v1/add. Fire-and-forget.
+
+    Parallel to ``_l4_call`` but without a subprocess: the gateway event is
+    materialised as a text blob and pushed straight to Thrall. This removes
+    the need for a cognee venv on the agent's host and is the cutover path
+    (M6) for agents that run on Mac mini / VPS peers without a local install.
+
+    Always invoked from inside ``_L4_POOL`` workers so a slow HTTP request
+    can't stall the gateway consumer. On any failure we log at WARN with an
+    ``[l4-http]`` tag and return — symmetry with ``_l4_call``.
+
+    Args:
+        subcmd: ``"gateway-write"`` or ``"gateway-write-group"`` (kept for log
+            parity with the subprocess path).
+        cfg: Agent config dict.
+        agent: Agent slug (``"silvana"``, ``"claude"``, …).
+        chat_id: Telegram chat / group id, used in metadata.
+        payload: ``{user_text|message_text, agent_response, extra_meta}``.
+        extra: Optional ``{source_category, user_handle, …}`` hints.
+    """
+    if not _l4_http_ready(cfg):
+        log.warning("[l4-http] %s skipped: missing cognee_remote_url / key / slug", subcmd)
+        return
+
+    extra = extra or {}
+    source = extra.get("source_category", "own_text")
+
+    # H2: whitelist gating must mirror silvana_cognee.dual_write.should_push_to_l4
+    # so the HTTP path can't quietly ingest categories the Python path filters
+    # out (e.g. external_media — third-party media that would pollute the graph
+    # as if it were the user's own preference). Drift here → silent divergence
+    # during the M6 cutover, which is exactly what we spent M2 preventing.
+    if source not in _L4_HTTP_PUSH_WHITELIST:
+        log.debug("[l4-http] %s skipped: source_category=%r not in whitelist",
+                  subcmd, source)
+        return
+
+    # Sanitise user-controlled strings BEFORE we check for emptiness: scrub_nulls
+    # can turn a payload that is "just \x00s" into empty, and clamp_len enforces
+    # the 3000-char cap so the gateway emits bytes identical to what the CLI
+    # produces for the same input (tests/test_gateway_l4_http.py pins this).
+    raw_user = payload.get("user_text", "") or ""
+    raw_resp = payload.get("agent_response", "") or ""
+    raw_msg = payload.get("message_text", "") or ""
+    user_text = _l4_http_clamp(_l4_http_scrub(raw_user))
+    agent_resp = _l4_http_clamp(_l4_http_scrub(raw_resp))
+    message_text = _l4_http_clamp(_l4_http_scrub(raw_msg))
+
+    remote_url = cfg["cognee_remote_url"].rstrip("/")
+    key_path = Path(expand(cfg["cognee_remote_api_key_file"]))
+    api_key = _l4_http_read_key(key_path)
+    if not api_key:
+        return  # _l4_http_read_key already logged the reason
+
+    slug = cfg["cognee_agent_slug"]
+    prefix = cfg.get("cognee_dataset_prefix") or ""
+    qualified = _l4_qualify_dataset(slug, prefix, source)
+
+    # Build an episode body that matches silvana_cognee.dual_write._compose_episode
+    # byte-for-byte so diffs across transports stay meaningful. For group
+    # writes the Python path sets agent_response="" and passes message_text as
+    # user_text; we do the same so the shared _compose_episode logic produces
+    # identical blobs regardless of which transport landed the event.
+    if subcmd == "gateway-write-group":
+        if not message_text.strip():
+            log.debug("[l4-http] %s skipped: empty message_text", subcmd)
+            return
+        user_handle = payload.get("user_handle", "anon")
+        body_user = message_text
+        body_resp = ""
+        channel = "group"
+        filename = f"group-{chat_id}-{int(time.time())}.txt"
+    else:
+        if not (user_text.strip() or agent_resp.strip()):
+            log.debug("[l4-http] %s skipped: empty user+agent text", subcmd)
+            return
+        user_handle = None
+        body_user = user_text
+        body_resp = agent_resp
+        channel = "dm"
+        filename = f"dm-{chat_id}-{int(time.time())}.txt"
+
+    # Byte-parity with silvana_cognee.dual_write._now_iso: UTC isoformat
+    # with microsecond precision. ``time.strftime`` produced naive
+    # second-precision strings, which made HTTP and subprocess episode
+    # headers diff-incompatible and defeated the M6 cutover audit plan.
+    # Honour COGNEE_MIGRATION_FROZEN_NOW so the reference tests on the
+    # Python side can pin a deterministic clock in both transports.
+    now_str = (
+        os.environ.get("COGNEE_MIGRATION_FROZEN_NOW")
+        or datetime.now(timezone.utc).isoformat()
+    )
+    body_parts = [
+        f"[chat:{chat_id} agent:{agent} at {now_str}]",
+        "[extraction hint: decision]",
+        f"[source:{source}] {body_user}",
+    ]
+    if body_resp:
+        body_parts.append("")
+        body_parts.append(f"[agent_response:] {body_resp}")
+    body = "\n".join(body_parts)
+
+    meta: dict = {
+        "agent": agent,
+        "chat_id": chat_id,
+        "source_category": source,
+        "channel": channel,
+        **(payload.get("extra_meta") or {}),
+    }
+    if user_handle is not None and "user_handle" not in meta:
+        meta["user_handle"] = user_handle
+
+    headers = {"X-Api-Key": api_key, "Accept": "application/json"}
+    files = {"data": (filename, body.encode("utf-8"), "text/plain")}
+    form = {"datasetName": qualified, "metadata": json.dumps(meta, default=str)}
+    try:
+        r = requests.post(
+            f"{remote_url}/api/v1/add",
+            headers=headers, files=files, data=form,
+            timeout=_L4_HTTP_TIMEOUT_S,
+        )
+    except requests.RequestException as exc:
+        log.warning("[l4-http] %s add transport error: %s", subcmd, exc)
+        return
+    if r.status_code >= 400:
+        log.warning(
+            "[l4-http] %s add rc=%s body=%s",
+            subcmd, r.status_code, (r.text or "")[:200],
+        )
+        return
+    log.info("[l4-http] %s add ok dataset=%s", subcmd, qualified)
+
+    # Optional cognify — when cfg.l4_http_cognify is truthy we also trigger
+    # a background graph rebuild so fresh writes become searchable without
+    # waiting for a nightly job. Off by default to keep latency bounded.
+    if cfg.get("l4_http_cognify") is True:
+        try:
+            rc = requests.post(
+                f"{remote_url}/api/v1/cognify",
+                headers={**headers, "Content-Type": "application/json"},
+                json={"datasets": [qualified], "runInBackground": True},
+                timeout=_L4_HTTP_COGNIFY_TIMEOUT_S,
+            )
+            if rc.status_code >= 400:
+                log.warning(
+                    "[l4-http] %s cognify rc=%s body=%s",
+                    subcmd, rc.status_code, (rc.text or "")[:200],
+                )
+        except requests.RequestException as exc:
+            log.warning("[l4-http] %s cognify transport error: %s", subcmd, exc)
+
+
+def _l4_call(subcmd: str, cli_args: list[str], payload: dict) -> None:
+    """Run ``silvana_cognee.cli`` in the cognee venv. Fire-and-forget.
+
+    Invoked only from inside ``_L4_POOL`` worker threads, so a slow subprocess
+    (up to the 90s timeout) never blocks the gateway main loop or consumer.
+    On any failure we log at WARN with an ``[l4]`` tag and return — gateway
+    never sees an exception and a message is never lost from its perspective.
+
+    Args:
+        subcmd: ``"gateway-write"`` or ``"gateway-write-group"``.
+        cli_args: Positional CLI flags (``["--agent", "silvana", ...]``).
+        payload: Body forwarded to the CLI over stdin as JSON.
+    """
+    if not _L4_CLI_ENABLED:
+        log.debug("[l4] venv not found at %s; skipping cognee path", _L4_VENV_PY)
+        return
+    try:
+        proc = subprocess.run(
+            [str(_L4_VENV_PY), "-m", "silvana_cognee.cli", subcmd, *cli_args],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            timeout=90,
+        )
+        if proc.returncode != 0:
+            log.warning(
+                "[l4] %s rc=%s stderr=%s",
+                subcmd, proc.returncode, (proc.stderr or "")[:400],
+            )
+            return
+        # Parse the last non-empty stdout line as the status JSON.
+        stdout = (proc.stdout or "").strip()
+        if stdout:
+            try:
+                status = json.loads(stdout.splitlines()[-1])
+                log.info("[l4] %s result=%s", subcmd, status)
+            except json.JSONDecodeError:
+                log.debug("[l4] %s stdout not json: %s", subcmd, stdout[:200])
+    except subprocess.TimeoutExpired:
+        log.warning("[l4] %s timed out after 90s", subcmd)
+    except FileNotFoundError as e:
+        log.warning("[l4] %s venv python missing: %s", subcmd, e)
+    except Exception as e:
+        log.warning("[l4] %s failed: %s", subcmd, e)
+
+
+def _l4_backend(cfg: dict) -> str:
+    """Read the configured L4 backend from agent cfg ('ov' default)."""
+    backend = cfg.get("l4_backend", "ov")
+    if isinstance(backend, str) and backend.lower() in ("ov", "cognee", "dual"):
+        return backend.lower()
+    return "ov"
 
 
 # ---------------------------------------------------------------------------
@@ -1953,8 +2286,54 @@ def append_to_hot_memory(agent: str, cfg: dict, user_text: str, agent_response: 
 # ---------------------------------------------------------------------------
 
 def push_to_openviking(agent: str, cfg: dict, user_text: str, agent_response: str, chat_id: int) -> None:
-    """Push conversation turn to OpenViking for semantic memory extraction.
-    Fire-and-forget in background thread."""
+    """Push conversation turn for L4 semantic memory extraction. Fire-and-forget.
+
+    T-19 routing inversion (PLAN §B-4):
+
+    * When ``cfg.l4_backend == "ov"`` (default) we run the legacy in-process
+      OV push kept here byte-for-byte (pinned by
+      ``silvana_cognee/tests/test_legacy_ov_push.py``).
+    * When ``cfg.l4_backend`` is ``"cognee"`` or ``"dual"`` we delegate the
+      full dispatch to ``silvana_cognee.dual_write.l4_write`` via the CLI
+      bridge (``_l4_call``) and return. The CLI handles OV too, so there is
+      no double-write.
+
+    The canonical predicate for "is this tag eligible" lives in
+    ``silvana_cognee.dual_write.should_push_to_l4``; callers gate on
+    source_tag before invoking this function.
+    """
+    backend = _l4_backend(cfg)
+    if backend != "ov":
+        # Delegate to the cognee backend. Two transports:
+        #   - ``http`` (M3): direct POST to shared Thrall. No local venv.
+        #   - ``subprocess`` (default): shell out to the cognee venv CLI,
+        #     which does the full OV+Cognee dispatch via dual_write.l4_write.
+        source_category = _infer_source_category(user_text)
+        payload = {
+            "user_text": user_text,
+            "agent_response": agent_response or "",
+            "extra_meta": {},
+        }
+        if _l4_transport(cfg) == "http":
+            _l4_http_call(
+                "gateway-write", cfg, agent, chat_id, payload,
+                extra={"source_category": source_category},
+            )
+        else:
+            _l4_call(
+                "gateway-write",
+                [
+                    "--agent", agent,
+                    "--chat-id", str(chat_id),
+                    # source_tag isn't passed into this function, so we infer it
+                    # from the `[source:...]` prefix we embed on the user_text.
+                    "--source-category", source_category,
+                ],
+                payload,
+            )
+        return
+
+    # --- Legacy OV path (backend == "ov") -----------------------------------
     ov_url = cfg.get("openviking_url")
     if not ov_url:
         return
@@ -1978,10 +2357,11 @@ def push_to_openviking(agent: str, cfg: dict, user_text: str, agent_response: st
         # Create session
         r = requests.post(f"{base}/sessions", headers=headers, json={}, timeout=10)
         if r.status_code != 200:
-            log.warning(f"[ov] create session failed: {r.status_code}")
+            log.warning(f"[ov] [{agent}/{chat_id}] create session failed: {r.status_code}")
             return
         sid = r.json().get("result", {}).get("session_id")
         if not sid:
+            log.warning(f"[ov] [{agent}/{chat_id}] no session_id in response")
             return
         # user_text already has [source:...] prefix from process_update
         ts = time.strftime("%Y-%m-%d %H:%M")
@@ -1999,25 +2379,33 @@ def push_to_openviking(agent: str, cfg: dict, user_text: str, agent_response: st
         else:
             guard = ""
         meta_prefix = f"[chat:{chat_id} agent:{agent} at {ts}]{guard}\n"
-        requests.post(
+        # AUDIT [HIGH] fix: previously unchecked rc -> silent drop. Now we
+        # log and stop the session early so the session DELETE still runs.
+        r_user = requests.post(
             f"{base}/sessions/{sid}/messages",
             headers=headers,
             json={"role": "user", "content": meta_prefix + user_text[:3000]},
             timeout=10,
         )
+        if r_user.status_code != 200:
+            log.warning(f"[ov] [{agent}/{chat_id}] user message rc={r_user.status_code}")
+            return
         if agent_response:
-            requests.post(
+            r_asst = requests.post(
                 f"{base}/sessions/{sid}/messages",
                 headers=headers,
                 json={"role": "assistant", "content": agent_response[:3000]},
                 timeout=10,
             )
+            if r_asst.status_code != 200:
+                log.warning(f"[ov] [{agent}/{chat_id}] assistant message rc={r_asst.status_code}")
+                return
         # Extract memories (runs LLM for structured extraction)
         ext = requests.post(f"{base}/sessions/{sid}/extract", headers=headers, json={}, timeout=60)
         extracted = ext.json().get("result", []) if ext.status_code == 200 else []
-        log.info(f"[ov] extracted {len(extracted)} memories for {agent}/{chat_id}")
+        log.info(f"[ov] [{agent}/{chat_id}] extracted {len(extracted)} memories")
     except Exception as e:
-        log.warning(f"[ov] push failed: {e}")
+        log.warning(f"[ov] [{agent}/{chat_id}] push failed: {e}")
     finally:
         # Always clean up session to prevent leaks
         if sid:
@@ -2027,13 +2415,31 @@ def push_to_openviking(agent: str, cfg: dict, user_text: str, agent_response: st
                 pass
 
 
+def _infer_source_category(user_text: str) -> str:
+    """Best-effort source_category recovery from the ``[source:...]`` prefix.
+
+    The legacy signature of ``push_to_openviking`` does not carry the tag, so
+    we read the bracket prefix the caller embedded earlier in the pipeline.
+    Defaults to ``own_text`` — the bridge's safest whitelist bucket.
+    """
+    if not user_text:
+        return "own_text"
+    if "[source:forwarded" in user_text:
+        return "forwarded"
+    if "[source:external_media" in user_text:
+        return "external_media"
+    if "[source:own_voice" in user_text:
+        return "own_voice"
+    return "own_text"
+
+
 def _auto_transcribe_group_voice(
     agent: str, cfg: dict, token: str, msg: dict
 ) -> None:
     """Auto-transcribe voice/audio/video_note in allowlisted groups.
 
     Downloads the file, transcribes via Groq Whisper, and replies with
-    the transcript as italic HTML. Fire-and-forget via _OV_POOL.
+    the transcript as italic HTML. Fire-and-forget via _L4_POOL.
     Does NOT interfere with normal message processing pipeline.
     """
     try:
@@ -2085,14 +2491,111 @@ def _auto_transcribe_group_voice(
         )
 
 
-def _push_group_message_to_ov(agent: str, cfg: dict, msg: dict) -> None:
-    """Push a group chat message to OpenViking for semantic logging.
+def _build_group_message_content(msg: dict) -> tuple[str, str, int]:
+    """Format a group message the same way legacy OV push did.
 
-    Fire-and-forget via _OV_POOL. Uses a separate OV user namespace
-    (configured via 'group_log_ov_user' in agent config) so group
-    messages don't mix with agent conversation memories.
+    Returned as ``(content, sender_name, chat_id)`` so both the in-process
+    OV path and the CLI bridge can share the formatting.
+    """
+    from_user = msg.get("from") or {}
+    sender_name = (
+        from_user.get("first_name", "")
+        + (" " + from_user.get("last_name", "") if from_user.get("last_name") else "")
+    ).strip() or "Unknown"
+    username = from_user.get("username", "")
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(msg.get("date", 0)))
+
+    lines = [
+        f"[EdgeLab Chat] {ts}",
+        f"From: {sender_name}" + (f" (@{username})" if username else ""),
+    ]
+    if text:
+        lines.append(text)
+
+    entities = msg.get("entities") or msg.get("caption_entities") or []
+    links = []
+    raw_text = msg.get("text") or msg.get("caption") or ""
+    for ent in entities:
+        if ent.get("type") == "url":
+            url = raw_text[ent["offset"]:ent["offset"] + ent["length"]]
+            links.append(url)
+        elif ent.get("type") == "text_link":
+            links.append(ent.get("url", ""))
+    if links:
+        lines.append("Links: " + ", ".join(links))
+
+    media_types = []
+    if msg.get("photo"):
+        media_types.append("[Photo]")
+    if msg.get("video"):
+        media_types.append("[Video]")
+    if msg.get("voice") or msg.get("audio"):
+        media_types.append("[Voice]")
+    if msg.get("document"):
+        media_types.append("[Document]")
+    if msg.get("sticker"):
+        media_types.append("[Sticker]")
+    if media_types:
+        lines.append(" ".join(media_types))
+
+    reply_msg = msg.get("reply_to_message")
+    if reply_msg:
+        quoted = (reply_msg.get("text") or reply_msg.get("caption") or "")[:100]
+        if quoted:
+            lines.append(f'Re: "{quoted}"')
+
+    chat_id = (msg.get("chat") or {}).get("id", 0)
+    return "\n".join(lines), sender_name, chat_id
+
+
+def _push_group_message_to_ov(agent: str, cfg: dict, msg: dict) -> None:
+    """Push a group chat message for L4 semantic logging. Fire-and-forget.
+
+    T-19 routing inversion matches ``push_to_openviking``: when the L4
+    backend is ``"ov"`` we run the in-process OV push (legacy shape). When
+    the backend is ``"cognee"`` or ``"dual"`` we delegate to the CLI bridge
+    (``_l4_call("gateway-write-group", ...)``) which owns the full OV+Cognee
+    dispatch, and we skip the inline OV code below to avoid double-writes.
     """
     try:
+        backend = _l4_backend(cfg)
+        content, sender_name, chat_id = _build_group_message_content(msg)
+        from_user = msg.get("from") or {}
+        username = from_user.get("username", "") or sender_name
+
+        if backend != "ov":
+            # Keep the HTTP and subprocess payloads byte-identical so diffing
+            # across transports during the M6 cutover stays meaningful. Python
+            # side (silvana_cognee.dual_write.l4_write_group) injects
+            # ``{"group": True, "user_handle": …}`` into extra_meta and pins
+            # source_category="group_mention" — mirror that here.
+            payload = {
+                "user_handle": username,
+                "message_text": content,
+                "extra_meta": {
+                    "sender_name": sender_name,
+                    "user_handle": username,
+                    "group": True,
+                },
+            }
+            if _l4_transport(cfg) == "http":
+                _l4_http_call(
+                    "gateway-write-group", cfg, agent, chat_id, payload,
+                    extra={"source_category": "group_mention"},
+                )
+            else:
+                _l4_call(
+                    "gateway-write-group",
+                    [
+                        "--agent", agent,
+                        "--group-chat-id", str(chat_id),
+                    ],
+                    payload,
+                )
+            return
+
+        # --- Legacy OV path (backend == "ov") -------------------------------
         ov_url = cfg.get("openviking_url")
         if not ov_url:
             return
@@ -2116,85 +2619,35 @@ def _push_group_message_to_ov(agent: str, cfg: dict, msg: dict) -> None:
         }
         base = f"{ov_url.rstrip('/')}/api/v1"
 
-        # Format message content
-        from_user = msg.get("from") or {}
-        sender_name = (
-            from_user.get("first_name", "")
-            + (" " + from_user.get("last_name", "") if from_user.get("last_name") else "")
-        ).strip() or "Unknown"
-        username = from_user.get("username", "")
-        text = (msg.get("text") or msg.get("caption") or "").strip()
-        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(msg.get("date", 0)))
-
-        # Build formatted content
-        lines = [
-            f"[EdgeLab Chat] {ts}",
-            f"From: {sender_name}" + (f" (@{username})" if username else ""),
-        ]
-        if text:
-            lines.append(text)
-
-        # Detect links in entities
-        entities = msg.get("entities") or msg.get("caption_entities") or []
-        links = []
-        raw_text = msg.get("text") or msg.get("caption") or ""
-        for ent in entities:
-            if ent.get("type") == "url":
-                url = raw_text[ent["offset"]:ent["offset"] + ent["length"]]
-                links.append(url)
-            elif ent.get("type") == "text_link":
-                links.append(ent.get("url", ""))
-        if links:
-            lines.append("Links: " + ", ".join(links))
-
-        # Media type indicators
-        media_types = []
-        if msg.get("photo"):
-            media_types.append("[Photo]")
-        if msg.get("video"):
-            media_types.append("[Video]")
-        if msg.get("voice") or msg.get("audio"):
-            media_types.append("[Voice]")
-        if msg.get("document"):
-            media_types.append("[Document]")
-        if msg.get("sticker"):
-            media_types.append("[Sticker]")
-        if media_types:
-            lines.append(" ".join(media_types))
-
-        # Reply context
-        reply_msg = msg.get("reply_to_message")
-        if reply_msg:
-            quoted = (reply_msg.get("text") or reply_msg.get("caption") or "")[:100]
-            if quoted:
-                lines.append(f'Re: "{quoted}"')
-
-        content = "\n".join(lines)
-
         # OV session: create -> add message -> extract -> cleanup
         sid = None
         r = requests.post(f"{base}/sessions", headers=headers, json={}, timeout=10)
         if r.status_code != 200:
-            log.warning(f"[ov-group] create session failed: {r.status_code}")
+            log.warning(f"[ov-group] [{agent}/{chat_id}] create session rc={r.status_code}")
             return
         sid = r.json().get("result", {}).get("session_id")
         if not sid:
+            log.warning(f"[ov-group] [{agent}/{chat_id}] no session_id in response")
             return
         try:
-            requests.post(
+            # AUDIT [HIGH] fix: previously unchecked rc -> silent drop.
+            r_msg = requests.post(
                 f"{base}/sessions/{sid}/messages",
                 headers=headers,
                 json={"role": "user", "content": content[:3000]},
                 timeout=10,
             )
+            if r_msg.status_code != 200:
+                log.warning(f"[ov-group] [{agent}/{chat_id}] message rc={r_msg.status_code}")
+                return
             ext = requests.post(
                 f"{base}/sessions/{sid}/extract",
                 headers=headers, json={}, timeout=60,
             )
             extracted = ext.json().get("result", []) if ext.status_code == 200 else []
             log.info(
-                f"[ov-group] extracted {len(extracted)} memories "
-                f"from {sender_name} in chat {msg['chat']['id']}"
+                f"[ov-group] [{agent}/{chat_id}] extracted {len(extracted)} memories "
+                f"from {sender_name}"
             )
         finally:
             try:
@@ -2246,6 +2699,16 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
     if not is_webhook and user_id not in allowlist:
         log.info(f"denied user_id={user_id} agent={agent}")
         return
+
+    # Early transcription for voice in groups so is_addressed_to_agent can check transcript
+    if is_group and not msg.get("_voice_transcript"):
+        voice_obj = msg.get("voice") or msg.get("audio") or msg.get("video_note")
+        if voice_obj:
+            local = download_telegram_file(token, voice_obj["file_id"], "voice", None)
+            if local:
+                transcript = transcribe_audio(local, agent_cfg=cfg) or ""
+                if transcript:
+                    msg["_voice_transcript"] = transcript
 
     # Group-chat gating: only respond if addressed via @mention, name, or reply
     bot_username = cfg.get("_bot_username")
@@ -2342,23 +2805,19 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
             elif reply_msg.get("audio"):
                 reply_body = "[audio]"
         reply_from = reply_msg.get("from") or {}
-        # Only label as agent's own message when reply is from THIS bot (compare user ids).
-        # Generic is_bot=True would let users spoof agent output via replies to other bots.
-        my_bot_id = cfg.get("_bot_user_id")
-        is_self_reply = (
-            isinstance(reply_from, dict)
-            and my_bot_id is not None
-            and reply_from.get("id") == my_bot_id
+        is_bot_reply = bool(reply_from.get("is_bot", False)) if isinstance(reply_from, dict) else False
+        sender_label = (
+            "agent's previous message"
+            if is_bot_reply
+            else (reply_from.get("first_name") if isinstance(reply_from, dict) else None) or "unknown"
         )
-        if is_self_reply:
-            sender_label = "agent's previous message"
-        elif isinstance(reply_from, dict) and reply_from.get("is_bot"):
-            # Another bot's message — label explicitly so agent does not trust it as own output.
-            sender_label = "other bot"
-        else:
-            sender_label = (
-                reply_from.get("first_name") if isinstance(reply_from, dict) else None
-            ) or "unknown"
+        if not is_bot_reply and isinstance(reply_from, dict):
+            reply_uname = reply_from.get("username")
+            reply_uid = reply_from.get("id")
+            if reply_uname:
+                sender_label = f"{sender_label} (@{reply_uname})"
+            if reply_uid:
+                sender_label = f"{sender_label} [id:{reply_uid}]"
         if reply_body:
             truncated = len(reply_body) > 1200
             snippet = reply_body[:1200].replace("\x00", "")
@@ -2412,9 +2871,15 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
     # Group context: prepend chat title and sender name so agent knows the source
     if is_group:
         chat_title = (msg.get("chat") or {}).get("title", "unknown")
-        sender = (msg.get("from") or {}).get("first_name", "unknown")
+        from_user = msg.get("from") or {}
+        sender = from_user.get("first_name", "unknown")
+        username = from_user.get("username")
+        from_user_id = from_user.get("id")
+        sender_label = f"{sender} (@{username})" if username else sender
+        if from_user_id:
+            sender_label = f"{sender_label} [id:{from_user_id}]"
         text_for_agent = (
-            f"[Group: {chat_title} | From: {sender}]\n{text_for_agent}"
+            f"[Group: {chat_title} | From: {sender_label}]\n{text_for_agent}"
         )
 
     log.info(f"[{agent}] chat={chat_id} user={user_id} src={source_tag}: {text[:100]}")
@@ -2471,13 +2936,16 @@ def process_update(agent: str, cfg: dict, token: str, update: dict, allowlist: l
     # Skip OV push if voice transcription failed (would pollute with error text)
     transcribe_failed = media_note and "transcription failed" in media_note
 
-    # OV push via bounded thread pool -- only for own content or forwarded (marked)
+    # L4 push via bounded thread pool -- only for own content or forwarded (marked).
+    # Canonical predicate lives in silvana_cognee.dual_write.should_push_to_l4;
+    # the gateway keeps an inline whitelist here to avoid importing the cognee
+    # venv at gateway start. Keep these two lists in sync.
     if source_tag in ("own_text", "own_voice", "forwarded") and not transcribe_failed:
-        _OV_POOL.submit(
+        _L4_POOL.submit(
             push_to_openviking, agent, cfg, text_for_ov,
             response or "(answered inline)", chat_id
         )
-    # external_media -> hot only, not OV memory extraction (to avoid polluting preferences)
+    # external_media -> hot only, not L4 memory extraction (to avoid polluting preferences)
 
     if response:  # not already delivered via edit-in-place
         try:
@@ -2639,10 +3107,8 @@ def _init_bot_metadata(agent: str, cfg: dict, token: str) -> None:
         return
     try:
         info = tg_api(token, "getMe")
-        result = info.get("result") or {}
-        bot_username = result.get("username")
+        bot_username = (info.get("result") or {}).get("username")
         cfg["_bot_username"] = bot_username
-        cfg["_bot_user_id"] = result.get("id")
         try:
             tg_api(token, "setMyCommands", commands=_BOT_COMMANDS)
         except Exception as e:
@@ -2714,11 +3180,13 @@ def polling_producer(
                     )
                     continue
 
-            # Log ALL messages from allowlisted groups to OpenViking
+            # Log ALL messages from allowlisted groups to L4 semantic memory
             # (fire-and-forget, before user_id check -- logs even
-            # non-allowlisted users' messages for group context)
+            # non-allowlisted users' messages for group context). The L4
+            # dispatcher (silvana_cognee.dual_write.l4_write_group) is the
+            # canonical predicate source; see _push_group_message_to_ov.
             if is_group and cfg.get("group_log_ov_user"):
-                _OV_POOL.submit(
+                _L4_POOL.submit(
                     _push_group_message_to_ov, agent, cfg, msg
                 )
 
@@ -2739,6 +3207,16 @@ def polling_producer(
                     allowed_topics = topic_routing[chat_id_str]
                     if thread_id is None or str(thread_id) not in allowed_topics:
                         continue  # message not in routed topic for this agent
+
+            # Early voice transcription in groups so is_addressed_to_agent can check transcript
+            if is_group and not msg.get("_voice_transcript"):
+                voice_obj = msg.get("voice") or msg.get("audio") or msg.get("video_note")
+                if voice_obj:
+                    local = download_telegram_file(token, voice_obj["file_id"], "voice", None)
+                    if local:
+                        transcript = transcribe_audio(local, agent_cfg=cfg) or ""
+                        if transcript:
+                            msg["_voice_transcript"] = transcript
 
             # Group-chat gating
             bot_username = cfg.get("_bot_username")
