@@ -30,7 +30,7 @@ Usage:
 
 Config structure (config.json):
     {
-        "allowlist_user_ids": [123456789],
+        "allowed_user_ids": [123456789],
         "webhook_port": 9090,
         "webhook_token": "your-secret-token",
         "agents": {
@@ -40,8 +40,7 @@ Config structure (config.json):
                 "model": "sonnet",
                 "timeout_sec": 120,
                 "streaming_mode": "partial",
-                "telegram_bot_token": "123456:AABBccdd...",
-                "telegram_bot_token_file": "/path/to/token.txt",
+                "bot_token": "123456:AABBccdd...",
                 "groq_api_key": "YOUR_GROQ_API_KEY",
                 "groq_api_key_file": "/path/to/groq.key",
                 "openviking_url": "http://127.0.0.1:1933",
@@ -54,10 +53,12 @@ Config structure (config.json):
         }
     }
 
-Token resolution order:
-- "telegram_bot_token" (direct value in config) takes priority
-- "telegram_bot_token_file" (path to file) used as fallback
-Same pattern for groq_api_key / groq_api_key_file.
+Token resolution order (priority first):
+- "bot_token"                (inline, EdgeLab Day 1 format)
+- "telegram_bot_token"       (inline, legacy Silvana/Kaelthas format)
+- "telegram_bot_token_file"  (path to file, legacy)
+Allowlist key resolution: "allowed_user_ids" first, "allowlist_user_ids" fallback.
+Same inline/file pattern for groq_api_key / groq_api_key_file.
 """
 from __future__ import annotations
 
@@ -744,11 +745,20 @@ def _resolve_token(cfg: dict, direct_key: str, file_key: str) -> str | None:
 
 
 def _resolve_telegram_token(cfg: dict) -> str:
-    """Resolve Telegram bot token from agent config. Raises if not found."""
-    token = _resolve_token(cfg, "telegram_bot_token", "telegram_bot_token_file")
+    """Resolve Telegram bot token from agent config. Raises if not found.
+
+    Accepted keys (in priority order):
+      - bot_token              (inline, EdgeLab Day 1 format)
+      - telegram_bot_token     (inline, legacy Silvana/Kaelthas format)
+      - telegram_bot_token_file (path to file with token, legacy)
+    """
+    token = _resolve_token(cfg, "bot_token", "telegram_bot_token_file")
+    if not token:
+        token = _resolve_token(cfg, "telegram_bot_token", "telegram_bot_token_file")
     if not token:
         raise ValueError(
-            "No telegram token: set 'telegram_bot_token' or 'telegram_bot_token_file' in agent config"
+            "No telegram token: set 'bot_token' (or 'telegram_bot_token' / "
+            "'telegram_bot_token_file') in agent config"
         )
     return token
 
@@ -3401,8 +3411,10 @@ def main() -> None:
         sys.exit(1)
 
     cfg = json.loads(CONFIG_PATH.read_text())
-    allowlist = cfg.get("allowlist_user_ids", [])
-    allowlist_groups = cfg.get("allowlist_group_ids", [])
+    # Accept both key names: 'allowed_user_ids' (Day 1 format) and
+    # 'allowlist_user_ids' (legacy). Day 1 takes priority.
+    allowlist = cfg.get("allowed_user_ids") or cfg.get("allowlist_user_ids", [])
+    allowlist_groups = cfg.get("allowed_group_ids") or cfg.get("allowlist_group_ids", [])
     agents = {
         k: v for k, v in cfg["agents"].items() if v.get("enabled")
     }
