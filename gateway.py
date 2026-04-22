@@ -1636,6 +1636,13 @@ def invoke_claude(
         "bypassPermissions",
     ]
 
+    # Enable extended thinking if configured (low|medium|high|xhigh|max).
+    # Thinking blocks are rendered by _ProgressDisplay as a "думаю:" line,
+    # which lets the student see the agent's reasoning in real time.
+    effort = cfg.get("effort", "")
+    if effort:
+        cmd.extend(["--effort", effort])
+
     # Inject system reminder via --append-system-prompt (if configured)
     active_reminder = cfg.get("_active_system_reminder", "")
     if active_reminder:
