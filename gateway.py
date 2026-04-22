@@ -1642,6 +1642,10 @@ def invoke_claude(
     effort = cfg.get("effort", "")
     if effort:
         cmd.extend(["--effort", effort])
+        # Opus 4.7 ships encrypted thinking by default (signature only, empty
+        # plain text). Force plain-text thinking so _ProgressDisplay can render
+        # the "думаю:" line.
+        cmd.extend(["--thinking-display", "summarized"])
 
     # Inject system reminder via --append-system-prompt (if configured)
     active_reminder = cfg.get("_active_system_reminder", "")
@@ -2071,28 +2075,29 @@ class _TaskBoundaryTracker:
             self.status_cb(f"<pre>{escape_html(body)}</pre>")
 
     def _render_activity(self) -> str:
-        """Single compact activity line instead of listing every tool call."""
+        """Render the last N tool calls with tool names and short details.
+
+        Shows a live stream of what the agent is doing:
+            ▸ bash git push -u origin feature/...
+            ▸ edit gateway.py
+            ▸ read /tmp/foo.json
+
+        Older tool calls beyond the window are collapsed into a single
+        "+ N earlier" line so the block stays compact on mobile.
+        """
         if not self.tool_calls:
             return ""
-        last = self.tool_calls[-1]
-        name = last["name"]
         total = len(self.tool_calls)
-        ACTIVITY_LABELS = {
-            "Read": "reading files",
-            "Write": "writing files",
-            "Edit": "editing files",
-            "MultiEdit": "editing files",
-            "Bash": "running commands",
-            "Grep": "searching code",
-            "Glob": "searching files",
-            "WebFetch": "fetching web",
-            "WebSearch": "web search",
-            "ToolSearch": "loading tools",
-            "Skill": "running skill",
-            "NotebookEdit": "editing notebook",
-        }
-        label = ACTIVITY_LABELS.get(name, name.lower())
-        return f"▸ {label} ({total})"
+        window = 5
+        recent = self.tool_calls[-window:]
+        lines: list[str] = []
+        if total > len(recent):
+            lines.append(f"▸ ... +{total - len(recent)} earlier")
+        for tc in recent:
+            detail = tc.get("detail") or tc.get("name", "")
+            detail = _mask_secrets(detail)
+            lines.append(f"▸ {detail}")
+        return "\n".join(lines)
 
     def _render_todos(self) -> str:
         done = sum(1 for t in self.todos if t.get("status") == "completed")
