@@ -3139,6 +3139,99 @@ def _init_bot_metadata(agent: str, cfg: dict, token: str) -> None:
         pass
 
 
+# --- Telegram media-group (album) buffer --------------------------------
+# Telegram delivers each photo of an album as a SEPARATE update, all sharing
+# the same `media_group_id`. Without buffering, the consumer would spawn one
+# Claude session per photo: the first photo starts answering before the
+# second photo even arrives. We buffer per-mgid for ~MEDIA_GROUP_FLUSH_SEC of
+# silence, then push ONE synthetic update with merged captions so the agent
+# sees the album as a single message.
+#
+# Pattern adapted from openclaw/extensions/telegram/src/bot-handlers.runtime.ts
+# (`mediaGroupBuffer` + `mediaGroupTimeoutMs`, default 500ms there; we use 700ms
+# here to better tolerate slow mobile uploads).
+MEDIA_GROUP_FLUSH_SEC = 0.7
+
+# Per-agent state: { agent: { mgid: { "msgs": [...], "first_upd": dict, "timer": Timer } } }
+_MEDIA_GROUP_BUFFERS: dict[str, dict[str, dict]] = {}
+_MEDIA_GROUP_LOCK = threading.Lock()
+
+
+def _flush_media_group(agent: str, mgid: str) -> None:
+    """Timer callback: merge buffered album messages into a single upd, queue it."""
+    with _MEDIA_GROUP_LOCK:
+        per_agent = _MEDIA_GROUP_BUFFERS.get(agent) or {}
+        entry = per_agent.pop(mgid, None)
+    if not entry:
+        return
+    msgs = entry["msgs"]
+    if not msgs:
+        return
+    first_upd = entry["first_upd"]
+    first_msg = msgs[0]
+    # Merge captions across the album (preserve order, deduplicate empties).
+    captions = []
+    for m in msgs:
+        cap = (m.get("caption") or "").strip()
+        if cap:
+            captions.append(cap)
+    merged_caption = "\n\n".join(captions) if captions else first_msg.get("caption", "")
+
+    # Build synthetic combined message. Keep first message's photo array so
+    # downstream code that reads msg["photo"][-1] still works; expose all
+    # album photos via _album_photos for richer consumers (consumer-side
+    # aggregation is a follow-up; today only the first photo is sent to Claude).
+    combined = dict(first_msg)
+    if merged_caption:
+        combined["caption"] = merged_caption
+    combined["_album"] = True
+    combined["_album_size"] = len(msgs)
+    combined["_album_photos"] = [m.get("photo", []) for m in msgs if m.get("photo")]
+    combined["_album_message_ids"] = [m.get("message_id") for m in msgs]
+
+    synthetic_upd = dict(first_upd)
+    synthetic_upd["message"] = combined
+
+    q = _MSG_QUEUES.get(agent)
+    if q is None:
+        log.warning(f"[{agent}] media-group flush: queue missing for mgid={mgid}")
+        return
+    q.put(synthetic_upd)
+    log.info(
+        f"[{agent}] media-group flush mgid={mgid} size={len(msgs)} "
+        f"captions={len(captions)} first_msg_id={first_msg.get('message_id')}"
+    )
+
+
+def _buffer_media_group(agent: str, upd: dict, msg: dict, mgid: str) -> None:
+    """Append to per-mgid buffer and (re)arm the silence timer.
+
+    Called from polling_producer instead of msg_queue.put when media_group_id
+    is present. The timer fires _flush_media_group after MEDIA_GROUP_FLUSH_SEC
+    of silence, which then queues a single combined update.
+    """
+    with _MEDIA_GROUP_LOCK:
+        per_agent = _MEDIA_GROUP_BUFFERS.setdefault(agent, {})
+        entry = per_agent.get(mgid)
+        if entry is None:
+            entry = {"msgs": [msg], "first_upd": upd, "timer": None}
+            per_agent[mgid] = entry
+        else:
+            entry["msgs"].append(msg)
+            old_timer = entry.get("timer")
+            if old_timer is not None:
+                try:
+                    old_timer.cancel()
+                except Exception:
+                    pass
+        new_timer = threading.Timer(
+            MEDIA_GROUP_FLUSH_SEC, _flush_media_group, args=(agent, mgid)
+        )
+        new_timer.daemon = True
+        entry["timer"] = new_timer
+        new_timer.start()
+
+
 def polling_producer(
     agent: str, cfg: dict, allowlist: list[int], offset_file: Path
 ) -> None:
@@ -3147,6 +3240,11 @@ def polling_producer(
 
     OOB commands (/stop, /status, /reset force) are handled instantly
     even when the consumer thread is blocked on invoke_claude().
+
+    Media-group albums (multiple photos sharing media_group_id) are buffered
+    via _buffer_media_group and emitted as a single combined update after
+    MEDIA_GROUP_FLUSH_SEC of silence, so the consumer spawns one Claude
+    session per album instead of one per photo.
     """
     token = _resolve_telegram_token(cfg)
     _init_bot_metadata(agent, cfg, token)
@@ -3271,6 +3369,16 @@ def polling_producer(
                     log.exception(
                         f"[{agent}] OOB command failed: {text}"
                     )
+                continue
+
+            # Album path: if this message belongs to a Telegram media-group
+            # (multiple photos shared in one bubble), buffer it instead of
+            # queueing immediately. The flush timer will emit a single
+            # combined update once the album has gone silent for
+            # MEDIA_GROUP_FLUSH_SEC. See _buffer_media_group / _flush_media_group.
+            mgid = msg.get("media_group_id")
+            if mgid:
+                _buffer_media_group(agent, upd, msg, str(mgid))
                 continue
 
             # Regular message -> queue for consumer
