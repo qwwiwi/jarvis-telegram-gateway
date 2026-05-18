@@ -1,5 +1,21 @@
 # Jarvis Telegram Gateway
 
+> ## ⚠ DEPRECATED — переезжайте на [dashi-plugin-claude-code](https://github.com/qwwiwi/dashi-plugin-claude-code)
+>
+> **D-day: 2026-06-15.** Anthropic 15 июня 2026 разделяет billing: `claude -p` (Agent SDK) уходит в отдельный $200/мес pool. Этот gateway спавнит `claude -p` на каждое сообщение → после cutover каждое Telegram-сообщение станет расходом из SDK pool, а не из Max subscription.
+>
+> Новая архитектура держит **одну** живую interactive Claude Code сессию на агента — расход остаётся в Max. Полная миграция за ~30-60 минут на агента, см. [migration guide](https://github.com/qwwiwi/dashi-plugin-claude-code/blob/main/docs/04-migration-from-gateway.md).
+>
+> **Сроки depreciation:**
+> - **до 2026-06-15** — gateway работает, переезжайте без спешки
+> - **2026-06-15** — Anthropic billing split; gateway технически работает, но дорого
+> - **2026-09-15** — этот репо переводится в `archived` (read-only)
+> - **2026-12-15** — последние compatibility patches; после этой даты — без поддержки
+>
+> Подробности — [DEPRECATION.md](DEPRECATION.md).
+
+---
+
 > Compatible with [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (Anthropic)
 
 Universal Telegram gateway for autonomous Claude Code agents. Connect your AI agent to Telegram with voice transcription, session management, real-time progress display, and semantic memory.
